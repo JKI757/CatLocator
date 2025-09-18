@@ -1,0 +1,10 @@
+build/
+sdkconfig
+sdkconfig.old
+*.pyc
+.pytest_cache/
+.cache/
+*.log
+.idea/
+.vscode/
+esp-idf/

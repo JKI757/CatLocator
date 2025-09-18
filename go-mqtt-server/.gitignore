@@ -1,0 +1,16 @@
+bin/
+*.test
+*.exe
+*.out
+cover.out
+
+# Go mod cache (optional)
+go.sum
+
+# IDE / editor
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs
+*.log

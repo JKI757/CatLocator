@@ -1,0 +1,56 @@
+menu "CatLocator MQTT Service"
+
+config CATLOCATOR_MQTT_URI
+    string "MQTT broker URI"
+    default "mqtt://catlocator.local:1883"
+    help
+        URI the beacon will use when connecting to the CatLocator server.
+
+config CATLOCATOR_MQTT_USERNAME
+    string "MQTT username"
+    default ""
+
+config CATLOCATOR_MQTT_PASSWORD
+    string "MQTT password"
+    default ""
+
+config CATLOCATOR_MQTT_LWT_TOPIC
+    string "MQTT last will topic"
+    default "beacons/Will"
+
+config CATLOCATOR_MQTT_LWT_MESSAGE
+    string "MQTT last will message"
+    default "{\"status\":\"offline\"}"
+
+endmenu
+
+menu "CatLocator LoRa Bridge"
+
+config CATLOCATOR_LORA_SPI_HOST
+    int "SPI host"
+    range 1 3
+    default 2
+    help
+        SPI host used to communicate with the SX1255 (1=HSPI, 2=VSPI, 3=SPI3).
+
+config CATLOCATOR_LORA_SCLK_GPIO
+    int "SCLK GPIO"
+    default 36
+
+config CATLOCATOR_LORA_MOSI_GPIO
+    int "MOSI GPIO"
+    default 35
+
+config CATLOCATOR_LORA_MISO_GPIO
+    int "MISO GPIO"
+    default 37
+
+config CATLOCATOR_LORA_CS_GPIO
+    int "CS GPIO"
+    default 34
+
+config CATLOCATOR_LORA_RESET_GPIO
+    int "RESET GPIO"
+    default 33
+
+endmenu

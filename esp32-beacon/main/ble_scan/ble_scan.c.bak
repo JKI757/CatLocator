@@ -1,0 +1,151 @@
+#include "ble_scan.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "config_portal.h"
+#include "esp_log.h"
+#include "mqtt_service.h"
+
+#include "esp_nimble_hci.h"
+#include "host/ble_gap.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+
+static const char *TAG = "ble_scan";
+
+static TaskHandle_t s_host_task;
+static bool s_scan_started;
+static config_portal_config_t s_latest_cfg;
+
+static void ble_host_task(void *param);
+static void start_scan(void);
+static int gap_event_handler(struct ble_gap_event *event, void *arg);
+static void format_address(const uint8_t *addr, char *out, size_t len);
+static void publish_reading(const struct ble_gap_disc_desc *desc);
+static void config_listener(const config_portal_config_t *cfg, void *ctx);
+
+esp_err_t ble_scan_init(void)
+{
+    ESP_LOGI(TAG, "Initializing NimBLE stack");
+
+    ESP_ERROR_CHECK(config_portal_register_listener(config_listener, NULL));
+
+    ESP_RETURN_ON_ERROR(esp_nimble_hci_and_controller_init(), TAG, "nimble hci init failed");
+    nimble_port_init();
+
+    ble_hs_cfg.sync_cb = start_scan;
+    ble_hs_cfg.reset_cb = NULL;
+
+    if (!s_host_task) {
+        nimble_port_freertos_init(ble_host_task);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ble_scan_start(void)
+{
+    if (s_scan_started) {
+        return ESP_OK;
+    }
+
+    if (ble_gap_disc_active()) {
+        return ESP_OK;
+    }
+
+    start_scan();
+    return ESP_OK;
+}
+
+static void ble_host_task(void *param)
+{
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+static void start_scan(void)
+{
+    struct ble_gap_disc_params params = {
+        .itvl = 0x00A0,
+        .window = 0x0050,
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0,
+        .passive = 0,
+        .filter_duplicates = 1,
+    };
+
+    int rc = ble_gap_disc(0, BLE_HS_FOREVER, &params, gap_event_handler, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to start scanning: %d", rc);
+    } else {
+        s_scan_started = true;
+        ESP_LOGI(TAG, "BLE scanning started");
+    }
+}
+
+static int gap_event_handler(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+        case BLE_GAP_EVENT_DISC:
+            publish_reading(&event->disc);
+            break;
+        case BLE_GAP_EVENT_DISC_COMPLETE:
+            s_scan_started = false;
+            start_scan();
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+static void config_listener(const config_portal_config_t *cfg, void *ctx)
+{
+    if (cfg) {
+        s_latest_cfg = *cfg;
+    }
+}
+
+static void publish_reading(const struct ble_gap_disc_desc *desc)
+{
+    if (s_latest_cfg.beacon_id[0] == '\0') {
+        return;
+    }
+
+    char addr[18];
+    format_address(desc->addr.val, addr, sizeof(addr));
+
+    time_t now = time(NULL);
+    struct tm tm_info = {0};
+    gmtime_r(&now, &tm_info);
+
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "beacons/%s/readings", s_latest_cfg.beacon_id);
+
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"beacon_id\":\"%s\",\"tag_id\":\"%s\",\"rssi\":%d,\"timestamp\":\"%s\",\"beacon_location\":{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}}",
+             s_latest_cfg.beacon_id,
+             addr,
+             desc->rssi,
+             timestamp,
+             s_latest_cfg.location_x,
+             s_latest_cfg.location_y,
+             s_latest_cfg.location_z);
+
+    esp_err_t err = mqtt_service_publish(topic, payload);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to publish reading: %s", esp_err_to_name(err));
+    }
+}
+
+static void format_address(const uint8_t *addr, char *out, size_t len)
+{
+    snprintf(out, len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+}

@@ -1,0 +1,25 @@
+{
+  "default": {
+    "build": {
+      "compileArgs": [],
+      "ninjaArgs": [],
+      "buildDirectoryPath": "/Users/josh/Documents/Code/Radio_Code/CatLocator/esp32-beacon/build",
+      "sdkconfigDefaults": []
+    },
+    "env": {},
+    "idfTarget": "esp32s3",
+    "flashBaudRate": "",
+    "monitorBaudRate": "",
+    "openOCD": {
+      "debugLevel": -1,
+      "configs": [],
+      "args": []
+    },
+    "tasks": {
+      "preBuild": "",
+      "preFlash": "",
+      "postBuild": "",
+      "postFlash": ""
+    }
+  }
+}

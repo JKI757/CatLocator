@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CatLocator Control Center</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        }
+        body {
+            margin: 0 auto;
+            max-width: 960px;
+            padding: 2rem 1.5rem 4rem;
+            line-height: 1.5;
+        }
+        header {
+            border-bottom: 1px solid #ccc;
+            margin-bottom: 1.5rem;
+        }
+        nav {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+        }
+        nav button {
+            border: 1px solid #999;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 0.4rem 0.9rem;
+            border-radius: 0.55rem;
+            cursor: pointer;
+            font-size: 0.95rem;
+        }
+        nav button.active {
+            background: #335dff;
+            color: #fff;
+            border-color: #335dff;
+        }
+        h1 {
+            margin-top: 0;
+        }
+        .grid {
+            display: grid;
+            gap: 1rem;
+        }
+        .card {
+            border: 1px solid #999;
+            border-radius: 0.75rem;
+            padding: 1rem 1.25rem;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .card h2 {
+            margin-top: 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        th, td {
+            border-bottom: 1px solid #bbb;
+            padding: 0.4rem 0.6rem;
+            text-align: left;
+            vertical-align: top;
+            word-break: break-word;
+        }
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+        .scroll-table {
+            max-height: 320px;
+            overflow-y: auto;
+            border: 1px solid #bbb;
+            border-radius: 0.5rem;
+            background: rgba(0, 0, 0, 0.03);
+            padding: 0.25rem;
+        }
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            align-items: flex-end;
+            margin-bottom: 0.75rem;
+        }
+        .controls label {
+            display: flex;
+            flex-direction: column;
+            font-size: 0.85rem;
+        }
+        .controls input {
+            margin-top: 0.25rem;
+            padding: 0.3rem 0.4rem;
+            border-radius: 0.35rem;
+            border: 1px solid #999;
+        }
+        .controls button {
+            border: 1px solid #999;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 0.35rem 0.9rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+        .controls button.primary {
+            border-color: #335dff;
+            background: #335dff;
+            color: #fff;
+        }
+        .muted {
+            color: #666;
+            font-size: 0.85rem;
+        }
+        footer {
+            margin-top: 2rem;
+            font-size: 0.85rem;
+            color: #666;
+        }
+        code {
+            background: rgba(0, 0, 0, 0.1);
+            padding: 0.2rem 0.35rem;
+            border-radius: 0.35rem;
+            font-size: 0.85em;
+        }
+        .view {
+            display: none;
+        }
+        .view.active {
+            display: block;
+        }
+        form label {
+            display: block;
+            margin-top: 0.9rem;
+        }
+        form input[type="text"],
+        form input[type="number"],
+        form textarea {
+            width: 100%;
+            padding: 0.45rem 0.55rem;
+            font-size: 1rem;
+            border-radius: 0.45rem;
+            border: 1px solid #999;
+        }
+        form textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+        form button {
+            margin-top: 1rem;
+            padding: 0.5rem 1.1rem;
+            font-size: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #335dff;
+            background: #335dff;
+            color: #fff;
+            cursor: pointer;
+        }
+        .message {
+            margin-top: 0.75rem;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>CatLocator Control Center</h1>
+        <p>Monitor beacons, update runtime settings, and push commands to your deployed devices.</p>
+    </header>
+
+    <nav>
+        <button data-view="dashboard" class="active">Dashboard</button>
+        <button data-view="config">Configuration</button>
+        <button data-view="beacon">Beacon Control</button>
+    </nav>
+
+    <section id="view-dashboard" class="view active">
+        <section class="grid">
+            <article class="card">
+                <h2>System Health</h2>
+                <p>HTTP health endpoints are live at <code>/healthz</code> and <code>/readyz</code>. Future revisions will surface beacon summaries and database state here.</p>
+            </article>
+            <article class="card">
+                <h2>Room Labeling</h2>
+                <p>When beacon data is available, this panel will guide you through tagging sessions for offline model training and uploading newly trained models.</p>
+            </article>
+            <article class="card">
+                <h2>Beacon Activity</h2>
+                <p>The embedded MQTT broker collects RSSI reports from CatLocator beacons. Use the simulator tool or physical hardware to populate this view.</p>
+                <div class="controls">
+                    <label>
+                        Beacon Filter
+                        <input type="text" id="filter-beacon" placeholder="beacon id fragment">
+                    </label>
+                    <label>
+                        Tag Filter
+                        <input type="text" id="filter-tag" placeholder="tag id fragment">
+                    </label>
+                    <button type="button" id="filter-reset">Reset Filters</button>
+                    <button type="button" id="list-clear" class="primary">Clear List</button>
+                </div>
+                <p id="readings-status" class="muted">Waiting for data…</p>
+                <div class="scroll-table">
+                    <table aria-label="Recent beacon readings">
+                        <thead>
+                            <tr>
+                                <th>Received</th>
+                                <th>Beacon</th>
+                                <th>Tag</th>
+                                <th>RSSI</th>
+                                <th>Location (x, y, z)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="readings-body">
+                            <tr><td colspan="5" class="muted">No readings yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </article>
+        </section>
+    </section>
+
+    <section id="view-config" class="view">
+        <article class="card">
+            <h2>Runtime Configuration</h2>
+            <p class="muted">Changes are persisted to SQLite. Network-facing settings take effect after restarting the server process.</p>
+            <form id="config-form">
+                <label>
+                    HTTP Port
+                    <input type="number" id="config-http-port" min="1" max="65535" required>
+                </label>
+                <button type="submit">Save Changes</button>
+                <p id="config-message" class="message muted"></p>
+            </form>
+        </article>
+    </section>
+
+    <section id="view-beacon" class="view">
+        <article class="card">
+            <h2>Beacon Command Console</h2>
+            <p>Send JSON commands to connected beacons. Leave the topic blank to target <code>beacons/&lt;beacon_id&gt;/commands</code>.</p>
+            <form id="beacon-form">
+                <label>
+                    Beacon ID
+                    <input type="text" id="beacon-id" placeholder="living-room-1">
+                </label>
+                <label>
+                    Topic Override
+                    <input type="text" id="beacon-topic" placeholder="optional MQTT topic">
+                </label>
+                <label>
+                    Payload (JSON)
+                    <textarea id="beacon-payload">{"action":"ping"}</textarea>
+                </label>
+                <button type="submit">Send Command</button>
+                <p id="beacon-message" class="message muted"></p>
+            </form>
+        </article>
+    </section>
+
+    <footer>
+        CatLocator &mdash; Indoor pet tracking by signal fusion.
+    </footer>
+
+    <script>
+        const statusEl = document.getElementById('readings-status');
+        const tableBody = document.getElementById('readings-body');
+        const filterBeaconInput = document.getElementById('filter-beacon');
+        const filterTagInput = document.getElementById('filter-tag');
+        const filterResetButton = document.getElementById('filter-reset');
+        const listClearButton = document.getElementById('list-clear');
+
+        const readingStore = [];
+        const readingKeys = new Set();
+        let beaconFilter = '';
+        let tagFilter = '';
+        const MAX_READINGS = 200;
+        let sinceToken = null;
+
+        function readingKey(reading) {
+            const received = reading.received_at || reading.recorded_at || '';
+            return `${reading.beacon_id}|${reading.tag_id}|${received}`;
+        }
+
+        function applyFilters(readings) {
+            return readings.filter((reading) => {
+                const beaconMatch = !beaconFilter || (reading.beacon_id || '').toLowerCase().includes(beaconFilter);
+                const tagMatch = !tagFilter || (reading.tag_id || '').toLowerCase().includes(tagFilter);
+                return beaconMatch && tagMatch;
+            });
+        }
+
+        function formatTime(value) {
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) {
+                return "N/A";
+            }
+            return date.toLocaleTimeString();
+        }
+
+        function renderReadings() {
+            const filtered = applyFilters(readingStore);
+            if (!readingStore.length) {
+                statusEl.textContent = 'Waiting for data…';
+            } else if (!filtered.length) {
+                statusEl.textContent = 'No readings match current filters.';
+            } else {
+                statusEl.textContent = `Showing ${filtered.length} of ${readingStore.length} recent reading(s).`;
+            }
+
+            if (!filtered.length) {
+                tableBody.innerHTML = '<tr><td colspan="5" class="muted">No readings to display.</td></tr>';
+                return;
+            }
+
+            const rows = filtered.map((reading) => {
+                const recorded = formatTime(reading.received_at || reading.recorded_at);
+                const loc = reading.beacon_location || { x: 0, y: 0, z: 0 };
+                const format = (value) => (typeof value === 'number' && !Number.isNaN(value) ? value.toFixed(2) : '0.00');
+                return `<tr>
+                        <td>${recorded}</td>
+                        <td>${reading.beacon_id}</td>
+                        <td>${reading.tag_id}</td>
+                        <td>${reading.rssi}</td>
+                        <td>${format(loc.x)}, ${format(loc.y)}, ${format(loc.z)}</td>
+                    </tr>`;
+            });
+            tableBody.innerHTML = rows.join('');
+        }
+
+        function ingestReadings(readings) {
+            if (!Array.isArray(readings)) {
+                return;
+            }
+
+            const normalised = readings.slice().sort((a, b) => {
+                const ta = Date.parse(a.received_at || a.recorded_at || 0);
+                const tb = Date.parse(b.received_at || b.recorded_at || 0);
+                return ta - tb;
+            });
+
+            normalised.forEach((reading) => {
+                const key = readingKey(reading);
+                if (!readingKeys.has(key)) {
+                    readingStore.unshift(reading);
+                    readingKeys.add(key);
+                }
+            });
+
+            while (readingStore.length > MAX_READINGS) {
+                const removed = readingStore.pop();
+                readingKeys.delete(readingKey(removed));
+            }
+
+            if (readingStore.length) {
+                const newest = readingStore[0];
+                const candidate = newest.received_at || newest.recorded_at;
+                const ts = candidate ? new Date(candidate) : null;
+                if (ts && !Number.isNaN(ts.getTime())) {
+                    sinceToken = ts.toISOString();
+                }
+            }
+        }
+
+        async function fetchReadings() {
+            try {
+                const params = new URLSearchParams();
+                params.set('limit', MAX_READINGS.toString());
+                if (sinceToken) {
+                    params.set('since', sinceToken);
+                }
+                const response = await fetch(`/api/readings?${params.toString()}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                ingestReadings(payload.readings || []);
+                renderReadings();
+            } catch (err) {
+                statusEl.textContent = `Failed to load readings: ${err.message}`;
+            }
+        }
+
+        filterBeaconInput.addEventListener('input', (event) => {
+            beaconFilter = event.target.value.trim().toLowerCase();
+            renderReadings();
+        });
+
+        filterTagInput.addEventListener('input', (event) => {
+            tagFilter = event.target.value.trim().toLowerCase();
+            renderReadings();
+        });
+
+        filterResetButton.addEventListener('click', () => {
+            filterBeaconInput.value = '';
+            filterTagInput.value = '';
+            beaconFilter = '';
+            tagFilter = '';
+            renderReadings();
+        });
+
+        listClearButton.addEventListener('click', () => {
+            readingStore.length = 0;
+            readingKeys.clear();
+            sinceToken = new Date().toISOString();
+            statusEl.textContent = 'Waiting for data…';
+            renderReadings();
+        });
+        const navButtons = document.querySelectorAll('nav button');
+        const views = {
+            dashboard: document.getElementById('view-dashboard'),
+            config: document.getElementById('view-config'),
+            beacon: document.getElementById('view-beacon'),
+        };
+
+        navButtons.forEach((button) => {
+            button.addEventListener('click', () => {
+                navButtons.forEach((btn) => btn.classList.remove('active'));
+                button.classList.add('active');
+                Object.values(views).forEach((view) => view.classList.remove('active'));
+                const view = views[button.dataset.view];
+                if (view) {
+                    view.classList.add('active');
+                }
+                if (button.dataset.view === 'config') {
+                    loadConfig();
+                }
+            });
+        });
+
+        async function fetchReadings() {
+            try {
+                const response = await fetch('/api/readings');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                const readings = payload.readings || [];
+
+                if (!readings.length) {
+                    statusEl.textContent = 'Connected to broker, awaiting beacon telemetry…';
+                    tableBody.innerHTML = '<tr><td colspan="5" class="muted">No readings yet.</td></tr>';
+                    return;
+                }
+
+                statusEl.textContent = `Displaying ${readings.length} most recent reading(s).`;
+                tableBody.innerHTML = readings.map((reading) => {
+                    const recorded = formatTime(reading.received_at || reading.recorded_at);
+                    const loc = reading.beacon_location || { x: 0, y: 0, z: 0 };
+                    const format = (value) => (typeof value === 'number' && !Number.isNaN(value) ? value.toFixed(2) : '0.00');
+                    return `<tr>
+                        <td>${recorded}</td>
+                        <td>${reading.beacon_id}</td>
+                        <td>${reading.tag_id}</td>
+                        <td>${reading.rssi}</td>
+                        <td>${format(loc.x)}, ${format(loc.y)}, ${format(loc.z)}</td>
+                    </tr>`;
+                }).join('');
+            } catch (err) {
+                statusEl.textContent = `Failed to load readings: ${err.message}`;
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchReadings();
+            setInterval(fetchReadings, 4000);
+            loadConfig();
+        });
+
+        const configForm = document.getElementById('config-form');
+        const configMessage = document.getElementById('config-message');
+        const configHttpPort = document.getElementById('config-http-port');
+
+        async function loadConfig() {
+            try {
+                const response = await fetch('/api/config');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                const persisted = payload.persisted || {};
+                const active = payload.active || {};
+                const port = persisted.http_port || active.http_port;
+                if (port) {
+                    configHttpPort.value = port;
+                }
+                configMessage.textContent = 'Restart the server after changing port values.';
+            } catch (err) {
+                configMessage.textContent = `Failed to load configuration: ${err.message}`;
+            }
+        }
+
+        configForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const httpPort = Number.parseInt(configHttpPort.value, 10);
+            if (!Number.isFinite(httpPort)) {
+                configMessage.textContent = 'Enter a valid HTTP port number.';
+                return;
+            }
+            try {
+                const response = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ http_port: httpPort }),
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                configMessage.textContent = `Saved (${payload.requires_restart ? 'restart required' : 'live'})`;
+            } catch (err) {
+                configMessage.textContent = `Failed to save: ${err.message}`;
+            }
+        });
+
+        const beaconForm = document.getElementById('beacon-form');
+        const beaconMessage = document.getElementById('beacon-message');
+
+        beaconForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const beaconId = document.getElementById('beacon-id').value.trim();
+            const topic = document.getElementById('beacon-topic').value.trim();
+            const payloadText = document.getElementById('beacon-payload').value.trim();
+
+            let parsedPayload;
+            try {
+                parsedPayload = payloadText ? JSON.parse(payloadText) : {};
+            } catch (err) {
+                beaconMessage.textContent = `Invalid JSON payload: ${err.message}`;
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/beacon-control/publish', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        beacon_id: beaconId,
+                        topic,
+                        payload: parsedPayload,
+                    }),
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                beaconMessage.textContent = 'Command sent.';
+            } catch (err) {
+                beaconMessage.textContent = `Failed to send command: ${err.message}`;
+            }
+        });
+    </script>
+</body>
+</html>
