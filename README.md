@@ -11,3 +11,6 @@ Consult each subdirectory for detailed build and usage instructions. The overall
 Run `./build.sh` to build the Go server (native + linux/arm64) and the ESP32 firmware. Artifacts land under `bin/server/` and `bin/firmware/`.
 
 > Note: Ensure `esp32-beacon/esp-idf` is a symlink or checkout of ESP-IDF containing `export.sh`, or set `IDF_EXPORT_SH`/`IDF_PATH` before running the build script.
+
+## License
+Released under the MIT License. See `LICENSE` for details.
