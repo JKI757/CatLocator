@@ -33,6 +33,15 @@ type IngestionError struct {
 	Error    string `json:"error"`
 }
 
+// TrainingCommand represents a labeling command emitted from the iOS app.
+type TrainingCommand struct {
+	Room       string    `json:"room"`
+	Command    string    `json:"command"`
+	Timestamp  time.Time `json:"timestamp"`
+	Source     string    `json:"source"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+
 // AppConfigEntry represents a persisted configuration key/value pair.
 type AppConfigEntry struct {
 	Key   string `json:"key"`

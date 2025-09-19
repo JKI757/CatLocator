@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -106,12 +108,17 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 func (a *App) handleMQTTPublish(ctx context.Context, msg mqttbroker.PublishMessage) {
-	const topicPrefix = "beacons/"
-	if !strings.HasPrefix(msg.Topic, topicPrefix) {
-		// Ignore topics outside the expected namespace for now.
-		return
+	switch {
+	case strings.HasPrefix(msg.Topic, "beacons/"):
+		a.handleBeaconReading(ctx, msg)
+	case strings.HasPrefix(msg.Topic, "catlocator/training/commands"):
+		a.handleTrainingCommand(ctx, msg)
+	default:
+		// ignore for now
 	}
+}
 
+func (a *App) handleBeaconReading(ctx context.Context, msg mqttbroker.PublishMessage) {
 	var reading model.BeaconReading
 	if err := json.Unmarshal(msg.Payload, &reading); err != nil {
 		a.logger.Warn("mqtt payload decode failed", "topic", msg.Topic, "error", err)
@@ -149,13 +156,68 @@ func (a *App) handleMQTTPublish(ctx context.Context, msg mqttbroker.PublishMessa
 	a.logger.Info("ingested beacon reading", "beacon", reading.BeaconID, "tag", reading.TagID, "rssi", reading.RSSI)
 }
 
+func (a *App) handleTrainingCommand(ctx context.Context, msg mqttbroker.PublishMessage) {
+	type payloadSchema struct {
+		Room      string `json:"room"`
+		Command   string `json:"command"`
+		Timestamp string `json:"timestamp"`
+		Source    string `json:"source"`
+	}
+
+	var payload payloadSchema
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		a.logger.Warn("training command decode failed", "error", err)
+		a.recordIngestionError(ctx, "training", msg.Payload, fmt.Errorf("decode payload: %w", err))
+		return
+	}
+
+	room := strings.TrimSpace(payload.Room)
+	command := strings.TrimSpace(strings.ToLower(payload.Command))
+	if room == "" || (command != "start" && command != "stop") {
+		err := fmt.Errorf("invalid training command (room=%q command=%q)", room, command)
+		a.logger.Warn("training command validation failed", "error", err)
+		a.recordIngestionError(ctx, "training", msg.Payload, err)
+		return
+	}
+
+	parsedTime, err := time.Parse(time.RFC3339Nano, payload.Timestamp)
+	if err != nil {
+		parsedTime, err = time.Parse(time.RFC3339, payload.Timestamp)
+	}
+	if err != nil {
+		parsedTime = time.Now().UTC()
+	}
+
+	commandModel := model.TrainingCommand{
+		Room:       room,
+		Command:    command,
+		Timestamp:  parsedTime,
+		Source:     payload.Source,
+		ReceivedAt: time.Now().UTC(),
+	}
+
+	storeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if err := a.store.InsertTrainingCommand(storeCtx, commandModel); err != nil {
+		a.logger.Error("failed to persist training command", "room", room, "command", command, "error", err)
+		a.recordIngestionError(ctx, "training", msg.Payload, err)
+		return
+	}
+
+	a.logger.Info("ingested training command", "room", room, "command", command, "source", payload.Source)
+}
+
 func (a *App) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.handleHealthz)
 	mux.HandleFunc("/readyz", a.handleReadyz)
 	mux.HandleFunc("/api/readings", a.handleRecentReadings)
+	mux.HandleFunc("/api/training/commands", a.handleRecentCommands)
 	mux.HandleFunc("/api/config", a.handleConfig)
 	mux.HandleFunc("/api/beacon-control/publish", a.handleBeaconPublish)
+	mux.HandleFunc("/api/export/training", a.handleExportTraining)
+	mux.HandleFunc("/api/admin/wipe", a.handleWipeDatabase)
 	mux.HandleFunc("/static/", func(w http.ResponseWriter, r *http.Request) {
 		http.StripPrefix("/static/", http.FileServer(http.Dir("web"))).ServeHTTP(w, r)
 	})
@@ -377,6 +439,195 @@ func (a *App) handleRecentReadings(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		a.logger.Error("failed to encode readings response", "error", err)
 	}
+}
+
+func (a *App) handleRecentCommands(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.store == nil {
+		http.Error(w, "store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			if parsed > 0 && parsed <= 500 {
+				limit = parsed
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	commands, err := a.store.RecentTrainingCommands(ctx, limit)
+	if err != nil {
+		a.logger.Error("failed to load training commands", "error", err)
+		http.Error(w, "failed to load commands", http.StatusInternalServerError)
+		return
+	}
+
+	response := struct {
+		Commands []model.TrainingCommand `json:"commands"`
+	}{Commands: commands}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		a.logger.Error("failed to encode commands response", "error", err)
+	}
+}
+
+func (a *App) handleExportTraining(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.store == nil {
+		http.Error(w, "store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	readings, err := a.store.AllBeaconReadings(ctx)
+	if err != nil {
+		a.logger.Error("export: failed to load readings", "error", err)
+		http.Error(w, "failed to load readings", http.StatusInternalServerError)
+		return
+	}
+
+	commands, err := a.store.AllTrainingCommands(ctx)
+	if err != nil {
+		a.logger.Error("export: failed to load commands", "error", err)
+		http.Error(w, "failed to load commands", http.StatusInternalServerError)
+		return
+	}
+
+	sort.Slice(readings, func(i, j int) bool {
+		return readings[i].RecordedAt.Before(readings[j].RecordedAt)
+	})
+
+	sort.Slice(commands, func(i, j int) bool {
+		return commands[i].Timestamp.Before(commands[j].Timestamp)
+	})
+
+	activeRoom := ""
+	activeSource := ""
+	cmdIdx := 0
+
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", "attachment; filename=catlocator_training.csv")
+
+	csvWriter := csv.NewWriter(w)
+	defer csvWriter.Flush()
+
+	if err := csvWriter.Write([]string{
+		"recorded_at",
+		"received_at",
+		"beacon_id",
+		"tag_id",
+		"rssi",
+		"room",
+		"beacon_x",
+		"beacon_y",
+		"beacon_z",
+		"session_source",
+	}); err != nil {
+		a.logger.Error("export: failed to write header", "error", err)
+		return
+	}
+
+	for _, reading := range readings {
+		ts := reading.RecordedAt
+		// apply command updates up to reading timestamp
+		for cmdIdx < len(commands) && !commands[cmdIdx].Timestamp.After(ts) {
+			cmd := commands[cmdIdx]
+			cmdIdx++
+			commandValue := strings.ToLower(strings.TrimSpace(cmd.Command))
+			switch commandValue {
+			case "start":
+				activeRoom = cmd.Room
+				activeSource = cmd.Source
+			case "stop":
+				if activeRoom == "" || strings.EqualFold(activeRoom, cmd.Room) {
+					activeRoom = ""
+					activeSource = ""
+				}
+			}
+		}
+
+		if activeRoom == "" {
+			continue
+		}
+
+		row := []string{
+			reading.RecordedAt.UTC().Format(time.RFC3339Nano),
+			reading.ReceivedAt.UTC().Format(time.RFC3339Nano),
+			reading.BeaconID,
+			reading.TagID,
+			strconv.Itoa(reading.RSSI),
+			activeRoom,
+			fmt.Sprintf("%.4f", reading.BeaconLocation.X),
+			fmt.Sprintf("%.4f", reading.BeaconLocation.Y),
+			fmt.Sprintf("%.4f", reading.BeaconLocation.Z),
+			activeSource,
+		}
+
+		if err := csvWriter.Write(row); err != nil {
+			a.logger.Error("export: failed to write row", "error", err)
+			return
+		}
+	}
+
+	if err := csvWriter.Error(); err != nil {
+		a.logger.Error("export: writer error", "error", err)
+	}
+}
+
+func (a *App) handleWipeDatabase(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.store == nil {
+		http.Error(w, "store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var body struct {
+		Confirm string `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	if strings.ToLower(strings.TrimSpace(body.Confirm)) != "wipe" {
+		http.Error(w, "confirmation required", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := a.store.WipeData(ctx); err != nil {
+		a.logger.Error("wipe: failed", "error", err)
+		http.Error(w, "failed to wipe data", http.StatusInternalServerError)
+		return
+	}
+
+	a.logger.Warn("wipe: all telemetry cleared")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) recordIngestionError(ctx context.Context, beaconID string, payload []byte, cause error) {

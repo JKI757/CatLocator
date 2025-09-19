@@ -86,6 +86,14 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			error TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		);`,
+		`CREATE TABLE IF NOT EXISTS training_commands (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			room TEXT NOT NULL,
+			command TEXT NOT NULL,
+			command_timestamp TEXT NOT NULL,
+			source TEXT,
+			received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		);`,
 		`CREATE TABLE IF NOT EXISTS app_config (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
@@ -275,4 +283,218 @@ func (s *Store) AppConfig(ctx context.Context) (map[string]string, error) {
 	}
 
 	return config, nil
+}
+
+// WipeData removes all telemetry, labeling, and command data while preserving configuration.
+func (s *Store) WipeData(ctx context.Context) error {
+	if s.db == nil {
+		return fmt.Errorf("store not initialized")
+	}
+
+	stmts := []string{
+		`DELETE FROM beacon_readings;`,
+		`DELETE FROM ingestion_errors;`,
+		`DELETE FROM training_commands;`,
+		`DELETE FROM room_labels;`,
+		`DELETE FROM room_models;`,
+	}
+
+	for _, stmt := range stmts {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("wipe data: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// AllBeaconReadings returns every stored beacon reading ordered by recorded time.
+func (s *Store) AllBeaconReadings(ctx context.Context) ([]model.StoredBeaconReading, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("store not initialized")
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT beacon_id, tag_id, rssi, x, y, z, recorded_at, received_at
+		 FROM beacon_readings
+		 ORDER BY recorded_at ASC;`)
+	if err != nil {
+		return nil, fmt.Errorf("query beacon readings: %w", err)
+	}
+	defer rows.Close()
+
+	var readings []model.StoredBeaconReading
+	for rows.Next() {
+		var (
+			beaconID      string
+			tagID         string
+			rssi          int
+			x, y, z       float64
+			recordedAtStr string
+			receivedAtStr string
+		)
+		if err := rows.Scan(&beaconID, &tagID, &rssi, &x, &y, &z, &recordedAtStr, &receivedAtStr); err != nil {
+			return nil, fmt.Errorf("scan beacon reading: %w", err)
+		}
+
+		recordedAt, err := time.Parse(time.RFC3339Nano, recordedAtStr)
+		if err != nil {
+			recordedAt, _ = time.Parse("2006-01-02T15:04:05Z07:00", recordedAtStr)
+		}
+
+		receivedAt, err := time.Parse(time.RFC3339Nano, receivedAtStr)
+		if err != nil {
+			receivedAt, _ = time.Parse("2006-01-02T15:04:05Z07:00", receivedAtStr)
+		}
+
+		readings = append(readings, model.StoredBeaconReading{
+			BeaconReading: model.BeaconReading{
+				BeaconID:  beaconID,
+				TagID:     tagID,
+				RSSI:      rssi,
+				Timestamp: recordedAt,
+				BeaconLocation: model.Location{
+					X: x,
+					Y: y,
+					Z: z,
+				},
+			},
+			RecordedAt: recordedAt,
+			ReceivedAt: receivedAt,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate beacon readings: %w", err)
+	}
+
+	return readings, nil
+}
+
+// InsertTrainingCommand stores a command emitted from labeling clients.
+func (s *Store) InsertTrainingCommand(ctx context.Context, cmd model.TrainingCommand) error {
+	if s.db == nil {
+		return fmt.Errorf("store not initialized")
+	}
+
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO training_commands (room, command, command_timestamp, source, received_at)
+		 VALUES (?, ?, ?, ?, ?);`,
+		cmd.Room,
+		cmd.Command,
+		cmd.Timestamp.UTC().Format(time.RFC3339Nano),
+		cmd.Source,
+		cmd.ReceivedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert training command: %w", err)
+	}
+	return nil
+}
+
+// RecentTrainingCommands returns recent commands ordered newest first.
+func (s *Store) RecentTrainingCommands(ctx context.Context, limit int) ([]model.TrainingCommand, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("store not initialized")
+	}
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT room, command, command_timestamp, source, received_at
+		 FROM training_commands
+		 ORDER BY received_at DESC
+		 LIMIT ?;`,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query training commands: %w", err)
+	}
+	defer rows.Close()
+
+	var commands []model.TrainingCommand
+	for rows.Next() {
+		var room, command, commandTS, source sql.NullString
+		var received string
+		if err := rows.Scan(&room, &command, &commandTS, &source, &received); err != nil {
+			return nil, fmt.Errorf("scan training command: %w", err)
+		}
+
+		ts, err := time.Parse(time.RFC3339Nano, commandTS.String)
+		if err != nil {
+			ts, _ = time.Parse("2006-01-02T15:04:05Z07:00", commandTS.String)
+		}
+		receivedAt, err := time.Parse(time.RFC3339Nano, received)
+		if err != nil {
+			receivedAt, _ = time.Parse("2006-01-02T15:04:05Z07:00", received)
+		}
+
+		commands = append(commands, model.TrainingCommand{
+			Room:       room.String,
+			Command:    command.String,
+			Timestamp:  ts,
+			Source:     source.String,
+			ReceivedAt: receivedAt,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate training commands: %w", err)
+	}
+
+	return commands, nil
+}
+
+// AllTrainingCommands returns all commands ordered by command timestamp ascending.
+func (s *Store) AllTrainingCommands(ctx context.Context) ([]model.TrainingCommand, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("store not initialized")
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT room, command, command_timestamp, source, received_at
+		 FROM training_commands
+		 ORDER BY command_timestamp ASC;`)
+	if err != nil {
+		return nil, fmt.Errorf("query training commands: %w", err)
+	}
+	defer rows.Close()
+
+	var commands []model.TrainingCommand
+	for rows.Next() {
+		var room, command, tsStr, source sql.NullString
+		var receivedStr string
+		if err := rows.Scan(&room, &command, &tsStr, &source, &receivedStr); err != nil {
+			return nil, fmt.Errorf("scan training command: %w", err)
+		}
+
+		ts, err := time.Parse(time.RFC3339Nano, tsStr.String)
+		if err != nil {
+			ts, _ = time.Parse("2006-01-02T15:04:05Z07:00", tsStr.String)
+		}
+		receivedAt, err := time.Parse(time.RFC3339Nano, receivedStr)
+		if err != nil {
+			receivedAt, _ = time.Parse("2006-01-02T15:04:05Z07:00", receivedStr)
+		}
+
+		commands = append(commands, model.TrainingCommand{
+			Room:       room.String,
+			Command:    command.String,
+			Timestamp:  ts,
+			Source:     source.String,
+			ReceivedAt: receivedAt,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate training commands: %w", err)
+	}
+
+	return commands, nil
 }

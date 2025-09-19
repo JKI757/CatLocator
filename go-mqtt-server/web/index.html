@@ -160,6 +160,22 @@
         .message {
             margin-top: 0.75rem;
         }
+        a.primary-link, button.primary-link {
+            display: inline-block;
+            margin-top: 0.5rem;
+            padding: 0.45rem 0.85rem;
+            border-radius: 0.5rem;
+            border: 1px solid #335dff;
+            background: #335dff;
+            color: #fff;
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+        a.primary-link:hover, button.primary-link:hover {
+            background: #264ccc;
+            border-color: #264ccc;
+        }
+
     </style>
 </head>
 <body>
@@ -183,6 +199,7 @@
             <article class="card">
                 <h2>Room Labeling</h2>
                 <p>When beacon data is available, this panel will guide you through tagging sessions for offline model training and uploading newly trained models.</p>
+                <a class="primary-link" href="/api/export/training">Export Training CSV</a>
             </article>
             <article class="card">
                 <h2>Beacon Activity</h2>
@@ -217,6 +234,27 @@
                     </table>
                 </div>
             </article>
+            <article class="card">
+                <h2>Training Commands</h2>
+                <p>Commands emitted by labeling clients help tie RSSI segments to rooms for supervised learning.</p>
+                <p id="commands-status" class="muted">Waiting for data…</p>
+                <div class="scroll-table">
+                    <table aria-label="Recent training commands">
+                        <thead>
+                            <tr>
+                                <th>Received</th>
+                                <th>Room</th>
+                                <th>Command</th>
+                                <th>Command Time</th>
+                                <th>Source</th>
+                            </tr>
+                        </thead>
+                        <tbody id="commands-body">
+                            <tr><td colspan="5" class="muted">No commands yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </article>
         </section>
     </section>
 
@@ -232,6 +270,9 @@
                 <button type="submit">Save Changes</button>
                 <p id="config-message" class="message muted"></p>
             </form>
+            <hr>
+            <button type="button" id="wipe-data" class="primary-link" style="background:#cc3333;border-color:#cc3333;">Wipe Telemetry Data</button>
+            <p class="muted">Clears beacon readings, training commands, labels, and ingestion errors. Configuration is preserved.</p>
         </article>
     </section>
 
@@ -269,6 +310,8 @@
         const filterTagInput = document.getElementById('filter-tag');
         const filterResetButton = document.getElementById('filter-reset');
         const listClearButton = document.getElementById('list-clear');
+        const commandsStatusEl = document.getElementById('commands-status');
+        const commandsBody = document.getElementById('commands-body');
 
         const readingStore = [];
         const readingKeys = new Set();
@@ -277,6 +320,7 @@
         const MAX_READINGS = 200;
         let sinceToken = null;
 
+        const commandStore = [];
         function readingKey(reading) {
             const received = reading.received_at || reading.recorded_at || '';
             return `${reading.beacon_id}|${reading.tag_id}|${received}`;
@@ -461,15 +505,65 @@
             }
         }
 
+
+        function renderCommands() {
+            if (!commandStore.length) {
+                commandsStatusEl.textContent = 'Waiting for data…';
+                commandsBody.innerHTML = '<tr><td colspan="5" class="muted">No commands yet.</td></tr>';
+                return;
+            }
+
+            commandsStatusEl.textContent = `Showing ${commandStore.length} recent command(s).`;
+            const rows = commandStore.map((cmd) => {
+                return `<tr>
+                        <td>${formatTime(cmd.received_at)}</td>
+                        <td>${cmd.room}</td>
+                        <td>${cmd.command?.toUpperCase() || ''}</td>
+                        <td>${formatTime(cmd.timestamp)}</td>
+                        <td>${cmd.source || ''}</td>
+                    </tr>`;
+            });
+            commandsBody.innerHTML = rows.join('');
+        }
+
+        function ingestCommands(commands) {
+            if (!Array.isArray(commands)) {
+                return;
+            }
+            const sorted = commands.slice().sort((a, b) => {
+                const ta = Date.parse(a.received_at || a.timestamp || 0);
+                const tb = Date.parse(b.received_at || b.timestamp || 0);
+                return ta - tb;
+            });
+            commandStore.splice(0, commandStore.length, ...sorted.reverse());
+            renderCommands();
+        }
+
+        async function fetchCommands() {
+            try {
+                const response = await fetch('/api/training/commands?limit=200');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                ingestCommands(payload.commands || []);
+            } catch (err) {
+                commandsStatusEl.textContent = `Failed to load commands: ${err.message}`;
+            }
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             fetchReadings();
+            fetchCommands();
             setInterval(fetchReadings, 4000);
+            setInterval(fetchCommands, 5000);
             loadConfig();
         });
 
         const configForm = document.getElementById('config-form');
         const configMessage = document.getElementById('config-message');
         const configHttpPort = document.getElementById('config-http-port');
+        const wipeButton = document.getElementById('wipe-data');
 
         async function loadConfig() {
             try {
@@ -488,6 +582,35 @@
             } catch (err) {
                 configMessage.textContent = `Failed to load configuration: ${err.message}`;
             }
+        }
+
+        if (wipeButton) {
+            wipeButton.addEventListener('click', async () => {
+                const confirmed = window.confirm('This will delete all telemetry and training data. Continue?');
+                if (!confirmed) {
+                    return;
+                }
+                try {
+                    const response = await fetch('/api/admin/wipe', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ confirm: 'wipe' })
+                    });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    readingStore.length = 0;
+                    readingKeys.clear();
+                    commandStore.length = 0;
+                    sinceToken = new Date().toISOString();
+                    renderReadings();
+                    renderCommands();
+                    commandsStatusEl.textContent = 'Data cleared.';
+                    statusEl.textContent = 'Data cleared.';
+                } catch (err) {
+                    window.alert(`Failed to wipe data: ${err.message}`);
+                }
+            });
         }
 
         configForm.addEventListener('submit', async (event) => {
