@@ -4,6 +4,7 @@
 
 #include "config_portal.h"
 #include "esp_check.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
 
@@ -15,10 +16,15 @@ static config_portal_config_t s_current_cfg;
 
 static void apply_config(const config_portal_config_t *config, void *ctx);
 static esp_err_t start_client_locked(void);
+static bool mqtt_uri_valid(const char *uri);
 
 esp_err_t mqtt_service_init(void)
 {
-    ESP_ERROR_CHECK(config_portal_register_listener(apply_config, NULL));
+    esp_err_t err = config_portal_register_listener(apply_config, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "config listener registration failed: %s", esp_err_to_name(err));
+        return err;
+    }
     s_should_start = false;
     return ESP_OK;
 }
@@ -78,8 +84,13 @@ static void apply_config(const config_portal_config_t *config, void *ctx)
 static esp_err_t start_client_locked(void)
 {
     if (s_current_cfg.mqtt_uri[0] == '\0') {
-        ESP_LOGW(TAG, "MQTT URI not set; skipping start");
+        ESP_LOGW(TAG, "MQTT URI not set; MQTT client idle");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!mqtt_uri_valid(s_current_cfg.mqtt_uri)) {
+        ESP_LOGW(TAG, "MQTT URI '%s' is invalid", s_current_cfg.mqtt_uri);
+        return ESP_ERR_INVALID_ARG;
     }
 
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -101,4 +112,13 @@ static esp_err_t start_client_locked(void)
 
     ESP_LOGI(TAG, "MQTT client started");
     return ESP_OK;
+}
+
+static bool mqtt_uri_valid(const char *uri)
+{
+    if (!uri || uri[0] == '\0') {
+        return false;
+    }
+
+    return strncmp(uri, "mqtt://", 7) == 0 || strncmp(uri, "mqtts://", 8) == 0;
 }

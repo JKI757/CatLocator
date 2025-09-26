@@ -24,7 +24,21 @@ Run the simulator to produce sample data:
 ```
 
 ## Frontend
-The dashboard (served at `/`) polls `/api/readings`, offers configuration and beacon control forms, and lets you clear or filter recent telemetry.
+The dashboard (served at `/`) polls `/api/readings`, offers configuration and beacon control forms, lets you define room coordinates (used by triangulation), and provides export/wipe tools.
 
 ## Cross-Build
 Run `./build.sh` to produce native and Linux/ARM64 binaries in `bin/`.
+
+## Training Data Export
+- `/api/training/commands` – recent start/stop events from labeling clients
+- `/api/export/training` – CSV of beacon readings labeled with active room, suitable for ML training
+- `/api/admin/wipe` – clears telemetry/commands (configuration retained)
+
+The dashboard shows both beacon readings and training commands, and includes Export/Wipe controls.
+
+## Location Stub
+The dashboard `Cat Location` tab calls `/api/location/cat` (currently stubbed). Replace `stubbedInference()` in `internal/app/app.go` with real model inference once available.
+
+## Cat Location
+- `/api/location/cat` returns both the stubbed ML estimate and a RSSI-based triangulation using beacon coordinates.
+- Dashboard tab “Cat Location” refreshes this endpoint for quick visualization.

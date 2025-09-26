@@ -1,5 +1,6 @@
 #include "ble_scan.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,6 +8,7 @@
 
 #include "config_portal.h"
 #include "esp_check.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "mqtt_service.h"
@@ -14,6 +16,7 @@
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_adv.h"
+#include "nimble/hci_common.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
@@ -23,6 +26,7 @@ static TaskHandle_t s_host_task;
 static bool s_scan_started;
 static config_portal_config_t s_latest_cfg;
 static uint32_t s_reporting_interval_ms = 5000;
+static bool s_debug_logging;
 
 typedef struct {
     uint8_t addr[6];
@@ -42,14 +46,48 @@ static void config_listener(const config_portal_config_t *cfg, void *ctx);
 static tag_cache_entry_t *find_cache_entry(const uint8_t *addr);
 static tag_cache_entry_t *allocate_cache_entry(const uint8_t *addr);
 static bool should_publish(tag_cache_entry_t *entry, int64_t now_us);
+static void debug_log_advert(const struct ble_gap_disc_desc *desc);
+static void schedule_debug_log(const struct ble_gap_disc_desc *desc);
+static void debug_log_task(void *param);
+static const char *event_type_str(uint8_t event_type);
+
+typedef struct {
+    struct ble_gap_disc_desc desc;
+    uint8_t data[BLE_HS_ADV_MAX_SZ];
+} debug_adv_t;
+
+static QueueHandle_t s_debug_queue;
+static TaskHandle_t s_debug_task;
 
 esp_err_t ble_scan_init(void)
 {
     ESP_LOGI(TAG, "Initializing NimBLE stack");
 
-    ESP_ERROR_CHECK(config_portal_register_listener(config_listener, NULL));
+    esp_err_t err = config_portal_register_listener(config_listener, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "config listener registration failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     ESP_RETURN_ON_ERROR(nimble_port_init(), TAG, "nimble init failed");
+
+    s_debug_logging = false;
+
+    if (!s_debug_queue) {
+        s_debug_queue = xQueueCreate(16, sizeof(debug_adv_t));
+        if (!s_debug_queue) {
+            ESP_LOGE(TAG, "Failed to create debug queue");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!s_debug_task) {
+        BaseType_t created = xTaskCreate(debug_log_task, "ble_debug", 4096, NULL, tskIDLE_PRIORITY + 2, &s_debug_task);
+        if (created != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create debug log task");
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     ble_hs_cfg.sync_cb = start_scan;
     ble_hs_cfg.reset_cb = NULL;
@@ -86,12 +124,12 @@ static void ble_host_task(void *param)
 static void start_scan(void)
 {
     struct ble_gap_disc_params params = {
-        .itvl = 0x00A0,
-        .window = 0x0050,
+        .itvl = 0x0080,
+        .window = 0x0080,
         .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
         .limited = 0,
         .passive = 0,
-        .filter_duplicates = 1,
+        .filter_duplicates = 0,
     };
 
     int rc = ble_gap_disc(0, BLE_HS_FOREVER, &params, gap_event_handler, NULL);
@@ -107,6 +145,9 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
         case BLE_GAP_EVENT_DISC:
+            if (s_debug_logging) {
+                schedule_debug_log(&event->disc);
+            }
             publish_reading(&event->disc);
             break;
         case BLE_GAP_EVENT_DISC_COMPLETE:
@@ -129,6 +170,20 @@ static void config_listener(const config_portal_config_t *cfg, void *ctx)
     if (cfg->reporting_interval_ms > 0) {
         s_reporting_interval_ms = cfg->reporting_interval_ms;
     }
+}
+
+void ble_scan_set_debug(bool enable)
+{
+    s_debug_logging = enable;
+    if (enable && s_debug_queue) {
+        xQueueReset(s_debug_queue);
+    }
+    ESP_LOGI(TAG, "BLE debug logging %s", enable ? "enabled" : "disabled");
+}
+
+bool ble_scan_debug_enabled(void)
+{
+    return s_debug_logging;
 }
 
 static tag_cache_entry_t *find_cache_entry(const uint8_t *addr)
@@ -200,12 +255,10 @@ static void publish_reading(const struct ble_gap_disc_desc *desc)
 
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
-    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) != 0) {
-        ESP_LOGW(TAG, "Failed to parse advertisement fields");
-    }
+    bool fields_valid = (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0);
 
     char tag_name[64] = "";
-    if (fields.name != NULL && fields.name_len > 0) {
+    if (fields_valid && fields.name != NULL && fields.name_len > 0) {
         size_t len = fields.name_len < sizeof(tag_name) - 1 ? fields.name_len : sizeof(tag_name) - 1;
         memcpy(tag_name, fields.name, len);
         tag_name[len] = '\0';
@@ -213,7 +266,7 @@ static void publish_reading(const struct ble_gap_disc_desc *desc)
 
     uint16_t manufacturer_id = 0xFFFF;
     char manufacturer_data[64] = "";
-    if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
+    if (fields_valid && fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
         manufacturer_id = ((uint16_t)fields.mfg_data[1] << 8) | fields.mfg_data[0];
         size_t copy_len = fields.mfg_data_len - 2;
         if (copy_len > sizeof(manufacturer_data) / 2) {
@@ -260,7 +313,7 @@ static void publish_reading(const struct ble_gap_disc_desc *desc)
                              manufacturer_data);
     }
 
-    if (fields.tx_pwr_lvl_is_present) {
+    if (fields_valid && fields.tx_pwr_lvl_is_present) {
         written += snprintf(payload + written, sizeof(payload) - written,
                              ",\"tx_power\":%d",
                              fields.tx_pwr_lvl);
@@ -282,4 +335,168 @@ static void format_address(const uint8_t *addr, char *out, size_t len)
 {
     snprintf(out, len, "%02X:%02X:%02X:%02X:%02X:%02X",
              addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+}
+
+static void debug_log_advert(const struct ble_gap_disc_desc *desc)
+{
+    char addr[18];
+    format_address(desc->addr.val, addr, sizeof(addr));
+
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) != 0) {
+        ESP_LOGD(TAG, "Debug: failed to parse advertisement fields for %s (corrupted data)", addr);
+        return;
+    }
+
+    char name[64] = "";
+    if (fields.name && fields.name_len > 0) {
+        size_t len = fields.name_len < sizeof(name) - 1 ? fields.name_len : sizeof(name) - 1;
+        memcpy(name, fields.name, len);
+        name[len] = '\0';
+    }
+
+    uint16_t manufacturer_id = 0xFFFF;
+    char manufacturer_data[64] = "";
+    if (fields.mfg_data && fields.mfg_data_len >= 2) {
+        manufacturer_id = ((uint16_t)fields.mfg_data[1] << 8) | fields.mfg_data[0];
+        size_t copy_len = fields.mfg_data_len - 2;
+        if (copy_len > sizeof(manufacturer_data) / 2) {
+            copy_len = sizeof(manufacturer_data) / 2;
+        }
+        char *ptr = manufacturer_data;
+        for (size_t i = 0; i < copy_len; ++i) {
+            sprintf(ptr, "%02X", fields.mfg_data[i + 2]);
+            ptr += 2;
+        }
+        *ptr = '\0';
+    }
+
+    const char *event_type = event_type_str(desc->event_type);
+
+    char raw_data[2 * 64 + 4];
+    size_t raw_len = desc->length_data;
+    size_t max_bytes = sizeof(raw_data) / 2;
+    if (raw_len > max_bytes) {
+        raw_len = max_bytes;
+    }
+    char *raw_ptr = raw_data;
+    for (size_t i = 0; i < raw_len; ++i) {
+        sprintf(raw_ptr, "%02X", desc->data[i]);
+        raw_ptr += 2;
+    }
+    if (raw_len < desc->length_data && (size_t)(raw_ptr - raw_data) <= sizeof(raw_data) - 4) {
+        strcpy(raw_ptr, "...");
+    } else {
+        *raw_ptr = '\0';
+    }
+
+    ESP_LOGI(TAG,
+             "Debug ADV addr=%s type=%s rssi=%d name=%s tx_power=%s raw=%s",
+             addr,
+             event_type,
+             desc->rssi,
+             name[0] ? name : "<unknown>",
+             fields.tx_pwr_lvl_is_present ? "present" : "n/a",
+             raw_data);
+
+    if (manufacturer_id != 0xFFFF) {
+        ESP_LOGI(TAG,
+                 "  manufacturer=0x%04X data=%s",
+                 manufacturer_id,
+                 manufacturer_data[0] ? manufacturer_data : "<none>");
+
+        if (manufacturer_id == 0x004C && fields.mfg_data_len >= 4) {
+            const uint8_t *mfg = fields.mfg_data;
+            uint8_t type = mfg[2];
+            uint8_t subtype = mfg[3];
+            if (type == 0x02 && subtype == 0x15 && fields.mfg_data_len >= 4 + 16 + 2 + 2 + 1) {
+                const uint8_t *uuid = &mfg[4];
+                uint16_t major = ((uint16_t)mfg[20] << 8) | mfg[21];
+                uint16_t minor = ((uint16_t)mfg[22] << 8) | mfg[23];
+                int8_t tx = (int8_t)mfg[24];
+                ESP_LOGI(TAG,
+                         "    iBeacon UUID=%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X major=%u minor=%u tx=%d",
+                         uuid[0], uuid[1], uuid[2], uuid[3],
+                         uuid[4], uuid[5], uuid[6], uuid[7],
+                         uuid[8], uuid[9], uuid[10], uuid[11],
+                         uuid[12], uuid[13], uuid[14], uuid[15],
+                         major,
+                         minor,
+                         tx);
+            } else {
+                ESP_LOGI(TAG, "    Apple AD type=0x%02X subtype=0x%02X", type, subtype);
+            }
+        }
+    }
+
+    if (fields.uuids16 && fields.num_uuids16 > 0) {
+        for (uint8_t i = 0; i < fields.num_uuids16; ++i) {
+            ESP_LOGI(TAG, "  uuid16=0x%04X", fields.uuids16[i].value);
+        }
+    }
+
+    if (fields.uuids128 && fields.num_uuids128 > 0) {
+        for (uint8_t i = 0; i < fields.num_uuids128; ++i) {
+            const ble_uuid128_t *uuid = &fields.uuids128[i];
+            ESP_LOGI(TAG,
+                     "  uuid128=%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                     uuid->value[15], uuid->value[14], uuid->value[13], uuid->value[12],
+                     uuid->value[11], uuid->value[10], uuid->value[9], uuid->value[8],
+                     uuid->value[7], uuid->value[6], uuid->value[5], uuid->value[4],
+                     uuid->value[3], uuid->value[2], uuid->value[1], uuid->value[0]);
+        }
+    }
+}
+
+static const char *event_type_str(uint8_t event_type)
+{
+    switch (event_type) {
+        case BLE_HCI_ADV_RPT_EVTYPE_ADV_IND:
+            return "ADV_IND";
+        case BLE_HCI_ADV_RPT_EVTYPE_DIR_IND:
+            return "ADV_DIRECT_IND";
+        case BLE_HCI_ADV_RPT_EVTYPE_SCAN_IND:
+            return "ADV_SCAN_IND";
+        case BLE_HCI_ADV_RPT_EVTYPE_NONCONN_IND:
+            return "ADV_NONCONN_IND";
+        case BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP:
+            return "SCAN_RSP";
+        default:
+            break;
+    }
+    return "UNKNOWN";
+}
+
+static void schedule_debug_log(const struct ble_gap_disc_desc *desc)
+{
+    if (!s_debug_queue) {
+        return;
+    }
+
+    debug_adv_t entry = {0};
+    entry.desc = *desc;
+    size_t copy_len = desc->length_data;
+    if (copy_len > sizeof(entry.data)) {
+        copy_len = sizeof(entry.data);
+    }
+    memcpy(entry.data, desc->data, copy_len);
+    entry.desc.data = entry.data;
+    entry.desc.length_data = copy_len;
+
+    xQueueSend(s_debug_queue, &entry, 0);
+}
+
+static void debug_log_task(void *param)
+{
+    (void)param;
+
+    debug_adv_t adv;
+    while (true) {
+        if (xQueueReceive(s_debug_queue, &adv, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        debug_log_advert(&adv.desc);
+    }
 }

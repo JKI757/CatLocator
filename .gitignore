@@ -27,3 +27,6 @@ esp32-beacon/sdkconfig.old
 
 # Other
 *.log
+
+# ML training artifacts
+ml-training/artifacts/

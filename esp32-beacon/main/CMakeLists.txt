@@ -6,8 +6,9 @@ set(srcs
     "mqtt_service/mqtt_service.c"
     "ble_scan/ble_scan.c"
     "lora_bridge/lora_bridge.c"
+    "serial_cli/serial_cli.c"
 )
 
 idf_component_register(SRCS ${srcs}
                       INCLUDE_DIRS "." "../include"
-                      REQUIRES esp_http_server esp_wifi esp_netif esp_event nvs_flash json mqtt bt esp_timer lwip driver)
+                      REQUIRES esp_http_server esp_wifi esp_netif esp_event nvs_flash json mqtt bt esp_timer lwip driver vfs)

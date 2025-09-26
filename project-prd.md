@@ -69,6 +69,16 @@ Non-goals for the initial version:
    - Support structured logging with log levels and correlation IDs per request.
    - Include configuration via environment variables / config file (port, database DSN, auth secrets, algorithm parameters).
    - Provide health check endpoints for readiness/liveness.
+7. **Network Discovery & Enrollment**
+   - Advertise the server endpoint on the LAN via DNS-SD/mDNS (Bonjour) using a dedicated `_catlocator._tcp` service so beacons can discover it without manual IP entry; no wide-area DNS dependency.
+   - Publish discovery metadata (MQTT host/port, TLS requirements, firmware update endpoint) in TXT records and refresh advertisements whenever configuration changes.
+   - Capture inventory reports from scanners in configuration mode, persist a catalog of seen beacons (MAC address, advertising name, manufacturer data, RSSI stats), and expose UI/API to let operators select which identifiers to track.
+   - Provide an authenticated API for enrolling new beacon/scanner devices discovered during configuration sweeps, including tagging and approval workflows.
+8. **Smart Home Integrations**
+   - Expose cat location and room transitions to Home Assistant via native MQTT discovery entities and a REST webhook for automations.
+   - Implement a Matter bridge (or HomeKit Accessory Protocol shim if Matter unavailable) that surfaces the tracked pet as a presence accessory with room/zone characteristics and real-time change events.
+   - Maintain a mapping between internal room identifiers and smart-home zones, allowing operators to configure which rooms are published and privacy controls for hiding tags.
+   - Provide subscription APIs/webhooks so third-party home platforms receive updates within 1 second of room changes.
 
 ### ESP32 Beacon Firmware (`esp32-beacon`)
 1. **Wi-Fi Connectivity**
@@ -93,7 +103,11 @@ Non-goals for the initial version:
      - Forms or REST endpoints to set beacon_id, location coordinates, reporting interval, MQTT credentials/server.
      - Simple authentication (default credentials, require change on first use).
    - Provide API or UI action to trigger firmware diagnostics (e.g., immediate scan, log dump).
-7. **Diagnostics & OTA Hooks**
+7. **Configuration Sweep Mode**
+   - Support a remotely-triggered configuration mode where scanners publish full BLE scan results (all detected beacons/tags with metadata such as MAC, advertised name, manufacturer data, RSSI) to a dedicated MQTT topic.
+   - Continue streaming detailed inventory data until receiving an explicit `exit-config` control message from the server or a timeout elapses.
+   - After exit, revert to the production whitelist and only report the selected beacon(s)/tag(s) designated by the server.
+8. **Diagnostics & OTA Hooks**
    - Serial debug logging with toggled verbosity.
    - Allow manual firmware update via file upload in UI (OTA in future version).
 

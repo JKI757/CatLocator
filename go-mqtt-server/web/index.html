@@ -105,6 +105,52 @@
             font-size: 0.9rem;
         }
         .controls button.primary {
+        .location-display {
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+        .location-display h3 {
+            font-size: 1.8rem;
+            margin: 0;
+        }
+        #cat-room-matches {
+            font-size: 0.9rem;
+        }
+        .room-definitions {
+            margin-top: 1.5rem;
+        }
+        .room-fields {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 0.5rem;
+        }
+        .room-form input {
+            padding: 0.4rem 0.5rem;
+            border-radius: 0.4rem;
+            border: 1px solid #999;
+        }
+        #room-table table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        .link-button {
+            background: none;
+            border: none;
+            color: #335dff;
+            cursor: pointer;
+        }
+        .link-button:hover {
+            text-decoration: underline;
+        }
+        #room-table th, #room-table td {
+            border-bottom: 1px solid #bbb;
+            padding: 0.35rem 0.4rem;
+            text-align: left;
+        }
+
+
             border-color: #335dff;
             background: #335dff;
             color: #fff;
@@ -188,6 +234,7 @@
         <button data-view="dashboard" class="active">Dashboard</button>
         <button data-view="config">Configuration</button>
         <button data-view="beacon">Beacon Control</button>
+        <button data-view="location">Cat Location</button>
     </nav>
 
     <section id="view-dashboard" class="view active">
@@ -273,6 +320,22 @@
             <hr>
             <button type="button" id="wipe-data" class="primary-link" style="background:#cc3333;border-color:#cc3333;">Wipe Telemetry Data</button>
             <p class="muted">Clears beacon readings, training commands, labels, and ingestion errors. Configuration is preserved.</p>
+                    <section class="room-definitions">
+                <h3>Room Definitions</h3>
+                <p class="muted">Map rooms to coordinates for triangulation heuristics.</p>
+                <div id="room-table" class="scroll-table" style="max-height:200px;"></div>
+                <form id="room-form" class="room-form">
+                    <div class="room-fields">
+                        <input type="text" id="room-name" placeholder="Room name" required>
+                        <input type="number" step="0.1" id="room-x" placeholder="X" required>
+                        <input type="number" step="0.1" id="room-y" placeholder="Y" required>
+                        <input type="number" step="0.1" id="room-z" placeholder="Z" required>
+                        <input type="number" step="0.1" id="room-radius" placeholder="Radius" required>
+                    </div>
+                    <button type="submit" class="primary-link" style="margin-top:0.5rem;">Add / Update Room</button>
+                    <p id="room-message" class="message muted"></p>
+                </form>
+            </section>
         </article>
     </section>
 
@@ -299,10 +362,28 @@
         </article>
     </section>
 
+    <section id="view-location" class="view">
+        <article class="card">
+            <h2>Where's the Cat?</h2>
+            <p>This is a stubbed preview of the location model output. Once the ML model is integrated the values will update in real time.</p>
+            <div class="location-display">
+                <h3 id="cat-room">Model estimate: —</h3>
+                <p id="cat-confidence" class="muted">Model confidence: —</p>
+                <p id="cat-updated" class="muted">Triangulated position: —</p>
+                <p id="cat-message" class="muted"></p>
+                <div id="cat-room-matches" class="muted">Nearest rooms: —</div>
+                <button type="button" id="refresh-location" class="primary-link">Refresh</button>
+            </div>
+        </article>
+    </section>
+
     <footer>
         CatLocator &mdash; Indoor pet tracking by signal fusion.
     </footer>
 
+    
+    
+    
     <script>
         const statusEl = document.getElementById('readings-status');
         const tableBody = document.getElementById('readings-body');
@@ -312,15 +393,50 @@
         const listClearButton = document.getElementById('list-clear');
         const commandsStatusEl = document.getElementById('commands-status');
         const commandsBody = document.getElementById('commands-body');
+        const catRoomEl = document.getElementById('cat-room');
+        const catConfidenceEl = document.getElementById('cat-confidence');
+        const catUpdatedEl = document.getElementById('cat-updated');
+        const catMessageEl = document.getElementById('cat-message');
+        const catRoomMatchesEl = document.getElementById('cat-room-matches');
+        const refreshLocationBtn = document.getElementById('refresh-location');
+
+        const beaconForm = document.getElementById('beacon-form');
+        const beaconMessage = document.getElementById('beacon-message');
+        const beaconIdInput = document.getElementById('beacon-id');
+        const beaconTopicInput = document.getElementById('beacon-topic');
+        const beaconPayloadInput = document.getElementById('beacon-payload');
+
+        const configForm = document.getElementById('config-form');
+        const configMessage = document.getElementById('config-message');
+        const configHttpPort = document.getElementById('config-http-port');
+        const wipeButton = document.getElementById('wipe-data');
+        const roomTable = document.getElementById('room-table');
+        const roomForm = document.getElementById('room-form');
+        const roomMessage = document.getElementById('room-message');
+        const roomNameInput = document.getElementById('room-name');
+        const roomXInput = document.getElementById('room-x');
+        const roomYInput = document.getElementById('room-y');
+        const roomZInput = document.getElementById('room-z');
+        const roomRadiusInput = document.getElementById('room-radius');
+
+        const views = {
+            dashboard: document.getElementById('view-dashboard'),
+            config: document.getElementById('view-config'),
+            beacon: document.getElementById('view-beacon'),
+            location: document.getElementById('view-location'),
+        };
+
+        const navButtons = document.querySelectorAll('nav button');
 
         const readingStore = [];
         const readingKeys = new Set();
+        const commandStore = [];
+        let roomDefinitions = [];
         let beaconFilter = '';
         let tagFilter = '';
         const MAX_READINGS = 200;
         let sinceToken = null;
 
-        const commandStore = [];
         function readingKey(reading) {
             const received = reading.received_at || reading.recorded_at || '';
             return `${reading.beacon_id}|${reading.tag_id}|${received}`;
@@ -335,9 +451,10 @@
         }
 
         function formatTime(value) {
+            if (!value) return '—';
             const date = new Date(value);
             if (Number.isNaN(date.getTime())) {
-                return "N/A";
+                return '—';
             }
             return date.toLocaleTimeString();
         }
@@ -360,16 +477,34 @@
             const rows = filtered.map((reading) => {
                 const recorded = formatTime(reading.received_at || reading.recorded_at);
                 const loc = reading.beacon_location || { x: 0, y: 0, z: 0 };
-                const format = (value) => (typeof value === 'number' && !Number.isNaN(value) ? value.toFixed(2) : '0.00');
+                const coord = (value) => (typeof value === 'number' && !Number.isNaN(value) ? value.toFixed(2) : '0.00');
                 return `<tr>
                         <td>${recorded}</td>
                         <td>${reading.beacon_id}</td>
                         <td>${reading.tag_id}</td>
                         <td>${reading.rssi}</td>
-                        <td>${format(loc.x)}, ${format(loc.y)}, ${format(loc.z)}</td>
+                        <td>${coord(loc.x)}, ${coord(loc.y)}, ${coord(loc.z)}</td>
                     </tr>`;
             });
             tableBody.innerHTML = rows.join('');
+        }
+
+        function renderCommands() {
+            if (!commandStore.length) {
+                commandsStatusEl.textContent = 'Waiting for data…';
+                commandsBody.innerHTML = '<tr><td colspan="5" class="muted">No commands yet.</td></tr>';
+                return;
+            }
+
+            commandsStatusEl.textContent = `Showing ${commandStore.length} recent command(s).`;
+            const rows = commandStore.map((cmd) => `<tr>
+                        <td>${formatTime(cmd.received_at)}</td>
+                        <td>${cmd.room}</td>
+                        <td>${cmd.command?.toUpperCase() || ''}</td>
+                        <td>${formatTime(cmd.timestamp)}</td>
+                        <td>${cmd.source || ''}</td>
+                    </tr>`);
+            commandsBody.innerHTML = rows.join('');
         }
 
         function ingestReadings(readings) {
@@ -406,6 +541,19 @@
             }
         }
 
+        function ingestCommands(commands) {
+            if (!Array.isArray(commands)) {
+                return;
+            }
+            const sorted = commands.slice().sort((a, b) => {
+                const ta = Date.parse(a.received_at || a.timestamp || 0);
+                const tb = Date.parse(b.received_at || b.timestamp || 0);
+                return tb - ta;
+            });
+            commandStore.splice(0, commandStore.length, ...sorted);
+            renderCommands();
+        }
+
         async function fetchReadings() {
             try {
                 const params = new URLSearchParams();
@@ -422,6 +570,69 @@
                 renderReadings();
             } catch (err) {
                 statusEl.textContent = `Failed to load readings: ${err.message}`;
+            }
+        }
+
+        async function fetchCommands() {
+            try {
+                const response = await fetch('/api/training/commands?limit=200');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                ingestCommands(payload.commands || []);
+            } catch (err) {
+                commandsStatusEl.textContent = `Failed to load commands: ${err.message}`;
+            }
+        }
+
+        async function fetchLocation() {
+            try {
+                const response = await fetch('/api/location/cat');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                if (catRoomEl) {
+                    const model = payload.model || {};
+                    catRoomEl.textContent = model.room ? `Model estimate: ${model.room}` : 'Model estimate: Unknown';
+                    const modelConfidence = typeof model.confidence === 'number' ? (model.confidence * 100).toFixed(1) : '—';
+                    catConfidenceEl.textContent = `Model confidence: ${modelConfidence}%`;
+                    catMessageEl.textContent = model.message || '';
+
+                    const tri = payload.triangulation || null;
+                    if (tri) {
+                        const coords = `(${tri.x.toFixed(2)}, ${tri.y.toFixed(2)}, ${tri.z.toFixed(2)})`;
+                        const triConfidence = typeof tri.confidence === 'number' ? (tri.confidence * 100).toFixed(1) : '—';
+                        const residual = typeof tri.residual === 'number' ? tri.residual.toFixed(3) : '—';
+                        catUpdatedEl.textContent = `Triangulated position: ${coords} • confidence ${triConfidence}% • residual ${residual} • beacons ${tri.beacons}`;
+                        if (tri.message) {
+                            catMessageEl.textContent = `${catMessageEl.textContent || ''} ${tri.message}`.trim();
+                        }
+                        if (Array.isArray(tri.rooms) && tri.rooms.length) {
+                            const rows = tri.rooms.slice(0, 3).map((room) => {
+                                const status = room.within_radius ? '✅' : '—';
+                                return `${status} ${room.name} (${room.distance.toFixed(2)}m, r=${room.radius.toFixed(2)}m)`;
+                            }).join('<br>');
+                            catRoomMatchesEl.innerHTML = `Nearest rooms:<br>${rows}`;
+                        } else {
+                            catRoomMatchesEl.textContent = 'Nearest rooms: unavailable';
+                        }
+                    } else {
+                        catUpdatedEl.textContent = 'Triangulated position: insufficient data';
+                        catRoomMatchesEl.textContent = 'Nearest rooms: unavailable';
+                    }
+                }
+            } catch (err) {
+                if (catRoomEl) {
+                    catRoomEl.textContent = 'Location unavailable';
+                    catConfidenceEl.textContent = `Error: ${err.message}`;
+                    catUpdatedEl.textContent = '';
+                    catMessageEl.textContent = '';
+                    if (catRoomMatchesEl) {
+                        catRoomMatchesEl.textContent = 'Nearest rooms: unavailable';
+                    }
+                }
             }
         }
 
@@ -446,16 +657,25 @@
         listClearButton.addEventListener('click', () => {
             readingStore.length = 0;
             readingKeys.clear();
+            commandStore.length = 0;
             sinceToken = new Date().toISOString();
             statusEl.textContent = 'Waiting for data…';
             renderReadings();
+            renderCommands();
+            if (catRoomEl) {
+                catRoomEl.textContent = '—';
+                catConfidenceEl.textContent = 'Model confidence: —';
+                catUpdatedEl.textContent = 'Triangulated position: —';
+                catMessageEl.textContent = '';
+                if (catRoomMatchesEl) {
+                    catRoomMatchesEl.textContent = 'Nearest rooms: —';
+                }
+            }
         });
-        const navButtons = document.querySelectorAll('nav button');
-        const views = {
-            dashboard: document.getElementById('view-dashboard'),
-            config: document.getElementById('view-config'),
-            beacon: document.getElementById('view-beacon'),
-        };
+
+        if (refreshLocationBtn) {
+            refreshLocationBtn.addEventListener('click', fetchLocation);
+        }
 
         navButtons.forEach((button) => {
             button.addEventListener('click', () => {
@@ -472,117 +692,164 @@
             });
         });
 
-        async function fetchReadings() {
+        function renderRoomTable() {
+            if (!roomTable) {
+                return;
+            }
+            if (!roomDefinitions.length) {
+                roomTable.innerHTML = '<div class="muted">No rooms defined.</div>';
+                return;
+            }
+            const rows = roomDefinitions.map((room, index) => {
+                return `<tr>
+                        <td>${room.name}</td>
+                        <td>${room.x.toFixed(2)}</td>
+                        <td>${room.y.toFixed(2)}</td>
+                        <td>${room.z.toFixed(2)}</td>
+                        <td>${room.radius.toFixed(2)}</td>
+                        <td><button type="button" data-index="${index}" class="link-button">Remove</button></td>
+                    </tr>`;
+            }).join('');
+            roomTable.innerHTML = `<table>
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>X</th>
+                            <th>Y</th>
+                            <th>Z</th>
+                            <th>Radius</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>`;
+            roomTable.querySelectorAll('button[data-index]').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    const idx = Number.parseInt(btn.dataset.index, 10);
+                    if (!Number.isNaN(idx)) {
+                        roomDefinitions.splice(idx, 1);
+                        saveRooms('Room removed');
+                    }
+                });
+            });
+        }
+
+        async function loadRooms() {
+            if (!roomTable) {
+                return;
+            }
             try {
-                const response = await fetch('/api/readings');
+                const response = await fetch('/api/rooms');
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}`);
                 }
                 const payload = await response.json();
-                const readings = payload.readings || [];
+                roomDefinitions = payload.rooms || [];
+                renderRoomTable();
+            } catch (err) {
+                roomTable.innerHTML = `<div class="muted">Failed to load rooms: ${err.message}</div>`;
+            }
+        }
 
-                if (!readings.length) {
-                    statusEl.textContent = 'Connected to broker, awaiting beacon telemetry…';
-                    tableBody.innerHTML = '<tr><td colspan="5" class="muted">No readings yet.</td></tr>';
+        async function saveRooms(message) {
+            try {
+                const response = await fetch('/api/rooms', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rooms: roomDefinitions }),
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                if (message && roomMessage) {
+                    roomMessage.textContent = message;
+                }
+                await loadRooms();
+            } catch (err) {
+                if (roomMessage) {
+                    roomMessage.textContent = `Failed to save rooms: ${err.message}`;
+                }
+            }
+        }
+
+        if (roomForm) {
+            roomForm.addEventListener('submit', (event) => {
+                event.preventDefault();
+                const name = roomNameInput.value.trim();
+                const x = Number.parseFloat(roomXInput.value);
+                const y = Number.parseFloat(roomYInput.value);
+                const z = Number.parseFloat(roomZInput.value);
+                const radius = Number.parseFloat(roomRadiusInput.value);
+                if (!name || Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(z) || Number.isNaN(radius) || radius <= 0) {
+                    roomMessage.textContent = 'Provide name, coordinates, and positive radius.';
                     return;
                 }
-
-                statusEl.textContent = `Displaying ${readings.length} most recent reading(s).`;
-                tableBody.innerHTML = readings.map((reading) => {
-                    const recorded = formatTime(reading.received_at || reading.recorded_at);
-                    const loc = reading.beacon_location || { x: 0, y: 0, z: 0 };
-                    const format = (value) => (typeof value === 'number' && !Number.isNaN(value) ? value.toFixed(2) : '0.00');
-                    return `<tr>
-                        <td>${recorded}</td>
-                        <td>${reading.beacon_id}</td>
-                        <td>${reading.tag_id}</td>
-                        <td>${reading.rssi}</td>
-                        <td>${format(loc.x)}, ${format(loc.y)}, ${format(loc.z)}</td>
-                    </tr>`;
-                }).join('');
-            } catch (err) {
-                statusEl.textContent = `Failed to load readings: ${err.message}`;
-            }
-        }
-
-
-        function renderCommands() {
-            if (!commandStore.length) {
-                commandsStatusEl.textContent = 'Waiting for data…';
-                commandsBody.innerHTML = '<tr><td colspan="5" class="muted">No commands yet.</td></tr>';
-                return;
-            }
-
-            commandsStatusEl.textContent = `Showing ${commandStore.length} recent command(s).`;
-            const rows = commandStore.map((cmd) => {
-                return `<tr>
-                        <td>${formatTime(cmd.received_at)}</td>
-                        <td>${cmd.room}</td>
-                        <td>${cmd.command?.toUpperCase() || ''}</td>
-                        <td>${formatTime(cmd.timestamp)}</td>
-                        <td>${cmd.source || ''}</td>
-                    </tr>`;
-            });
-            commandsBody.innerHTML = rows.join('');
-        }
-
-        function ingestCommands(commands) {
-            if (!Array.isArray(commands)) {
-                return;
-            }
-            const sorted = commands.slice().sort((a, b) => {
-                const ta = Date.parse(a.received_at || a.timestamp || 0);
-                const tb = Date.parse(b.received_at || b.timestamp || 0);
-                return ta - tb;
-            });
-            commandStore.splice(0, commandStore.length, ...sorted.reverse());
-            renderCommands();
-        }
-
-        async function fetchCommands() {
-            try {
-                const response = await fetch('/api/training/commands?limit=200');
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+                const existingIndex = roomDefinitions.findIndex((room) => room.name.toLowerCase() === name.toLowerCase());
+                const roomDef = { name, x, y, z, radius };
+                if (existingIndex >= 0) {
+                    roomDefinitions[existingIndex] = roomDef;
+                    roomMessage.textContent = 'Room updated';
+                } else {
+                    roomDefinitions.push(roomDef);
+                    roomMessage.textContent = 'Room added';
                 }
-                const payload = await response.json();
-                ingestCommands(payload.commands || []);
-            } catch (err) {
-                commandsStatusEl.textContent = `Failed to load commands: ${err.message}`;
-            }
+                roomNameInput.value = '';
+                roomXInput.value = '';
+                roomYInput.value = '';
+                roomZInput.value = '';
+                roomRadiusInput.value = '';
+                saveRooms(roomMessage.textContent);
+            });
+        }
+
+        if (roomTable) {
+            loadRooms();
         }
 
         document.addEventListener('DOMContentLoaded', () => {
             fetchReadings();
             fetchCommands();
+            fetchLocation();
             setInterval(fetchReadings, 4000);
             setInterval(fetchCommands, 5000);
+            setInterval(fetchLocation, 5000);
             loadConfig();
+            loadRooms();
         });
 
-        const configForm = document.getElementById('config-form');
-        const configMessage = document.getElementById('config-message');
-        const configHttpPort = document.getElementById('config-http-port');
-        const wipeButton = document.getElementById('wipe-data');
+        function loadConfig() {
+            fetch('/api/config')
+                .then((response) => response.json())
+                .then((data) => {
+                    if (data.persisted && data.persisted.CATLOCATOR_HTTP_PORT) {
+                        configHttpPort.value = data.persisted.CATLOCATOR_HTTP_PORT;
+                    } else if (data.active && data.active.http_port) {
+                        configHttpPort.value = data.active.http_port;
+                    }
+                })
+                .catch((error) => {
+                    configMessage.textContent = `Failed to load config: ${error.message}`;
+                });
+        }
 
-        async function loadConfig() {
+        configForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const port = Number.parseInt(configHttpPort.value, 10);
             try {
-                const response = await fetch('/api/config');
+                const response = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ http_port: port })
+                });
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}`);
                 }
                 const payload = await response.json();
-                const persisted = payload.persisted || {};
-                const active = payload.active || {};
-                const port = persisted.http_port || active.http_port;
-                if (port) {
-                    configHttpPort.value = port;
-                }
-                configMessage.textContent = 'Restart the server after changing port values.';
+                configMessage.textContent = `Saved (${payload.requires_restart ? 'restart required' : 'live'})`;
             } catch (err) {
-                configMessage.textContent = `Failed to load configuration: ${err.message}`;
+                configMessage.textContent = `Failed to save: ${err.message}`;
             }
-        }
+        });
 
         if (wipeButton) {
             wipeButton.addEventListener('click', async () => {
@@ -605,6 +872,12 @@
                     sinceToken = new Date().toISOString();
                     renderReadings();
                     renderCommands();
+                    if (catRoomEl) {
+                        catRoomEl.textContent = '—';
+                        catConfidenceEl.textContent = 'Model confidence: —';
+                        catUpdatedEl.textContent = 'Triangulated position: —';
+                        catMessageEl.textContent = '';
+                    }
                     commandsStatusEl.textContent = 'Data cleared.';
                     statusEl.textContent = 'Data cleared.';
                 } catch (err) {
@@ -613,64 +886,37 @@
             });
         }
 
-        configForm.addEventListener('submit', async (event) => {
-            event.preventDefault();
-            const httpPort = Number.parseInt(configHttpPort.value, 10);
-            if (!Number.isFinite(httpPort)) {
-                configMessage.textContent = 'Enter a valid HTTP port number.';
-                return;
-            }
-            try {
-                const response = await fetch('/api/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ http_port: httpPort }),
-                });
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+        if (beaconForm) {
+            beaconForm.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const beaconId = beaconIdInput.value.trim();
+                const topic = beaconTopicInput.value.trim();
+                let payload;
+                try {
+                    payload = beaconPayloadInput.value ? JSON.parse(beaconPayloadInput.value) : {};
+                } catch (err) {
+                    beaconMessage.textContent = `Invalid JSON payload: ${err.message}`;
+                    return;
                 }
-                const payload = await response.json();
-                configMessage.textContent = `Saved (${payload.requires_restart ? 'restart required' : 'live'})`;
-            } catch (err) {
-                configMessage.textContent = `Failed to save: ${err.message}`;
-            }
-        });
-
-        const beaconForm = document.getElementById('beacon-form');
-        const beaconMessage = document.getElementById('beacon-message');
-
-        beaconForm.addEventListener('submit', async (event) => {
-            event.preventDefault();
-            const beaconId = document.getElementById('beacon-id').value.trim();
-            const topic = document.getElementById('beacon-topic').value.trim();
-            const payloadText = document.getElementById('beacon-payload').value.trim();
-
-            let parsedPayload;
-            try {
-                parsedPayload = payloadText ? JSON.parse(payloadText) : {};
-            } catch (err) {
-                beaconMessage.textContent = `Invalid JSON payload: ${err.message}`;
-                return;
-            }
-
-            try {
-                const response = await fetch('/api/beacon-control/publish', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        beacon_id: beaconId,
-                        topic,
-                        payload: parsedPayload,
-                    }),
-                });
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+                try {
+                    const response = await fetch('/api/beacon-control/publish', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            beacon_id: beaconId,
+                            topic,
+                            payload
+                        })
+                    });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    beaconMessage.textContent = 'Command sent.';
+                } catch (err) {
+                    beaconMessage.textContent = `Failed to send: ${err.message}`;
                 }
-                beaconMessage.textContent = 'Command sent.';
-            } catch (err) {
-                beaconMessage.textContent = `Failed to send command: ${err.message}`;
-            }
-        });
+            });
+        }
     </script>
 </body>
 </html>

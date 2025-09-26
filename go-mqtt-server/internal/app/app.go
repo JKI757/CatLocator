@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -215,9 +216,11 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/api/readings", a.handleRecentReadings)
 	mux.HandleFunc("/api/training/commands", a.handleRecentCommands)
 	mux.HandleFunc("/api/config", a.handleConfig)
+	mux.HandleFunc("/api/rooms", a.handleRooms)
 	mux.HandleFunc("/api/beacon-control/publish", a.handleBeaconPublish)
 	mux.HandleFunc("/api/export/training", a.handleExportTraining)
 	mux.HandleFunc("/api/admin/wipe", a.handleWipeDatabase)
+	mux.HandleFunc("/api/location/cat", a.handleCatLocation)
 	mux.HandleFunc("/static/", func(w http.ResponseWriter, r *http.Request) {
 		http.StripPrefix("/static/", http.FileServer(http.Dir("web"))).ServeHTTP(w, r)
 	})
@@ -250,6 +253,60 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		a.serveConfig(w, r)
 	case http.MethodPost:
 		a.updateConfig(w, r)
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *App) handleRooms(w http.ResponseWriter, r *http.Request) {
+	if a.store == nil {
+		http.Error(w, "store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		rooms, err := a.store.GetRoomDefinitions(ctx)
+		if err != nil {
+			a.logger.Error("rooms get failed", "error", err)
+			http.Error(w, "failed to load rooms", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(struct {
+			Rooms []model.RoomDefinition `json:"rooms"`
+		}{Rooms: rooms})
+	case http.MethodPost:
+		var payload struct {
+			Rooms []model.RoomDefinition `json:"rooms"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid payload", http.StatusBadRequest)
+			return
+		}
+		for i := range payload.Rooms {
+			room := &payload.Rooms[i]
+			room.Name = strings.TrimSpace(room.Name)
+			if room.Name == "" {
+				http.Error(w, "room name required", http.StatusBadRequest)
+				return
+			}
+			if room.Radius <= 0 {
+				http.Error(w, "room radius must be positive", http.StatusBadRequest)
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := a.store.SaveRoomDefinitions(ctx, payload.Rooms); err != nil {
+			a.logger.Error("rooms save failed", "error", err)
+			http.Error(w, "failed to save rooms", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -628,6 +685,249 @@ func (a *App) handleWipeDatabase(w http.ResponseWriter, r *http.Request) {
 
 	a.logger.Warn("wipe: all telemetry cleared")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) handleCatLocation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	modelEstimate := stubbedInference()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	var triPayload *struct {
+		X          float64     `json:"x"`
+		Y          float64     `json:"y"`
+		Z          float64     `json:"z"`
+		Confidence float64     `json:"confidence"`
+		Residual   float64     `json:"residual"`
+		Beacons    int         `json:"beacons"`
+		Message    string      `json:"message"`
+		Rooms      []RoomMatch `json:"rooms"`
+	}
+
+	if a.store != nil {
+		rooms, err := a.store.GetRoomDefinitions(ctx)
+		if err != nil {
+			a.logger.Error("failed to load room definitions", "error", err)
+		}
+		if latest, err := a.store.LatestBeaconReadings(ctx); err == nil {
+			if tri := triangulateLocation(latest, rooms); tri != nil {
+				triPayload = &struct {
+					X          float64     `json:"x"`
+					Y          float64     `json:"y"`
+					Z          float64     `json:"z"`
+					Confidence float64     `json:"confidence"`
+					Residual   float64     `json:"residual"`
+					Beacons    int         `json:"beacons"`
+					Message    string      `json:"message"`
+					Rooms      []RoomMatch `json:"rooms"`
+				}{
+					X:          tri.Location.X,
+					Y:          tri.Location.Y,
+					Z:          tri.Location.Z,
+					Confidence: tri.Confidence,
+					Residual:   tri.Residual,
+					Beacons:    tri.BeaconCount,
+					Message:    tri.Message,
+					Rooms:      tri.Rooms,
+				}
+			}
+		}
+	}
+
+	response := struct {
+		Model struct {
+			Room       string  `json:"room"`
+			Confidence float64 `json:"confidence"`
+			Message    string  `json:"message"`
+		} `json:"model"`
+		Triangulation *struct {
+			X          float64     `json:"x"`
+			Y          float64     `json:"y"`
+			Z          float64     `json:"z"`
+			Confidence float64     `json:"confidence"`
+			Residual   float64     `json:"residual"`
+			Beacons    int         `json:"beacons"`
+			Message    string      `json:"message"`
+			Rooms      []RoomMatch `json:"rooms"`
+		} `json:"triangulation,omitempty"`
+		UpdatedAt string `json:"updated_at"`
+	}{
+		Model: struct {
+			Room       string  `json:"room"`
+			Confidence float64 `json:"confidence"`
+			Message    string  `json:"message"`
+		}{
+			Room:       modelEstimate.Room,
+			Confidence: modelEstimate.Confidence,
+			Message:    modelEstimate.Message,
+		},
+		Triangulation: triPayload,
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		a.logger.Error("cat location encode failed", "error", err)
+	}
+}
+
+type inferenceResult struct {
+	Room       string
+	Confidence float64
+	Message    string
+}
+
+type triangulationResult struct {
+	Location    model.Location
+	Confidence  float64
+	Residual    float64
+	BeaconCount int
+	Message     string
+	Rooms       []RoomMatch
+}
+
+type RoomMatch struct {
+	Name         string  `json:"name"`
+	Distance     float64 `json:"distance"`
+	Radius       float64 `json:"radius"`
+	WithinRadius bool    `json:"within_radius"`
+}
+
+func triangulateLocation(readings []model.StoredBeaconReading, rooms []model.RoomDefinition) *triangulationResult {
+	if len(readings) < 3 {
+		return &triangulationResult{
+			BeaconCount: len(readings),
+			Message:     "At least three beacons required",
+		}
+	}
+
+	type point struct {
+		x, y, z float64
+		dist    float64
+	}
+
+	points := make([]point, 0, len(readings))
+	for _, r := range readings {
+		d := rssiToDistance(r.RSSI)
+		if !math.IsNaN(d) && d > 0 {
+			points = append(points, point{
+				x:    r.BeaconLocation.X,
+				y:    r.BeaconLocation.Y,
+				z:    r.BeaconLocation.Z,
+				dist: d,
+			})
+		}
+	}
+
+	if len(points) < 3 {
+		return &triangulationResult{
+			BeaconCount: len(points),
+			Message:     "Insufficient high-quality beacons",
+		}
+	}
+
+	ref := points[0]
+	var a11, a12, a22, b1, b2 float64
+	for i := 1; i < len(points); i++ {
+		pi := points[i]
+		ai := 2 * (pi.x - ref.x)
+		bi := 2 * (pi.y - ref.y)
+		ci := (pi.x*pi.x + pi.y*pi.y - pi.dist*pi.dist) - (ref.x*ref.x + ref.y*ref.y - ref.dist*ref.dist)
+
+		a11 += ai * ai
+		a12 += ai * bi
+		a22 += bi * bi
+		b1 += ai * ci
+		b2 += bi * ci
+	}
+
+	det := a11*a22 - a12*a12
+	if math.Abs(det) < 1e-9 {
+		return &triangulationResult{
+			BeaconCount: len(points),
+			Message:     "Triangulation unstable",
+		}
+	}
+
+	x := (b1*a22 - b2*a12) / det
+	y := (a11*b2 - a12*b1) / det
+
+	var weightSum, zSum float64
+	for _, p := range points {
+		w := 1.0 / (p.dist + 1e-6)
+		weightSum += w
+		zSum += w * p.z
+	}
+	z := 0.0
+	if weightSum > 0 {
+		z = zSum / weightSum
+	}
+
+	var residual float64
+	for _, p := range points {
+		dx := x - p.x
+		dy := y - p.y
+		dz := z - p.z
+		predicted := math.Sqrt(dx*dx + dy*dy + dz*dz)
+		diff := predicted - p.dist
+		residual += diff * diff
+	}
+	residual = math.Sqrt(residual / float64(len(points)))
+
+	confidence := math.Exp(-residual)
+	if confidence > 1 {
+		confidence = 1
+	}
+
+	matches := make([]RoomMatch, 0, len(rooms))
+	for _, room := range rooms {
+		dx := x - room.X
+		dy := y - room.Y
+		dz := z - room.Z
+		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+		matches = append(matches, RoomMatch{
+			Name:         room.Name,
+			Distance:     dist,
+			Radius:       room.Radius,
+			WithinRadius: dist <= room.Radius,
+		})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].Distance < matches[j].Distance
+	})
+
+	return &triangulationResult{
+		Location:    model.Location{X: x, Y: y, Z: z},
+		Confidence:  confidence,
+		Residual:    residual,
+		BeaconCount: len(points),
+		Message:     "Distance estimates derived from RSSI via path-loss model",
+		Rooms:       matches,
+	}
+}
+
+func rssiToDistance(rssi int) float64 {
+	// Log-distance path loss model with default parameters
+	txPower := -59.0 // expected RSSI at 1 meter
+	n := 2.0         // path-loss exponent (free space)
+	exponent := (txPower - float64(rssi)) / (10 * n)
+	return math.Pow(10, exponent)
+}
+
+func stubbedInference() inferenceResult {
+	rooms := []string{"Living Room", "Kitchen", "Bedroom", "Office"}
+	idx := int(time.Now().UnixNano() % int64(len(rooms)))
+	return inferenceResult{
+		Room:       rooms[idx],
+		Confidence: 0.42,
+		Message:    "Stubbed inference – replace with ML model output",
+	}
 }
 
 func (a *App) recordIngestionError(ctx context.Context, beaconID string, payload []byte, cause error) {

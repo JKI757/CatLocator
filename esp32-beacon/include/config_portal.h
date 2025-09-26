@@ -30,6 +30,7 @@ esp_err_t config_portal_start_async(void);
 esp_err_t config_portal_register_listener(config_portal_listener_t cb, void *ctx);
 esp_err_t config_portal_get_config(config_portal_config_t *out);
 bool config_portal_has_credentials(void);
+esp_err_t config_portal_set_config(const config_portal_config_t *cfg);
 
 #ifdef __cplusplus
 }

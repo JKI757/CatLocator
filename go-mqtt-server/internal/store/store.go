@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -285,6 +287,50 @@ func (s *Store) AppConfig(ctx context.Context) (map[string]string, error) {
 	return config, nil
 }
 
+const roomDefinitionsKey = "room_definitions"
+
+// GetRoomDefinitions loads stored room definitions (may be empty).
+func (s *Store) GetRoomDefinitions(ctx context.Context) ([]model.RoomDefinition, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("store not initialized")
+	}
+
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM app_config WHERE key = ?;`, roomDefinitionsKey).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get room definitions: %w", err)
+	}
+
+	var rooms []model.RoomDefinition
+	if err := json.Unmarshal([]byte(raw), &rooms); err != nil {
+		return nil, fmt.Errorf("decode room definitions: %w", err)
+	}
+	return rooms, nil
+}
+
+// SaveRoomDefinitions persists room definitions.
+func (s *Store) SaveRoomDefinitions(ctx context.Context, rooms []model.RoomDefinition) error {
+	if s.db == nil {
+		return fmt.Errorf("store not initialized")
+	}
+
+	bytes, err := json.Marshal(rooms)
+	if err != nil {
+		return fmt.Errorf("encode room definitions: %w", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;`,
+		roomDefinitionsKey, string(bytes)); err != nil {
+		return fmt.Errorf("save room definitions: %w", err)
+	}
+	return nil
+}
+
 // WipeData removes all telemetry, labeling, and command data while preserving configuration.
 func (s *Store) WipeData(ctx context.Context) error {
 	if s.db == nil {
@@ -367,6 +413,73 @@ func (s *Store) AllBeaconReadings(ctx context.Context) ([]model.StoredBeaconRead
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate beacon readings: %w", err)
+	}
+
+	return readings, nil
+}
+
+// LatestBeaconReadings returns the most recent reading for each beacon.
+func (s *Store) LatestBeaconReadings(ctx context.Context) ([]model.StoredBeaconReading, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("store not initialized")
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT br.beacon_id, br.tag_id, br.rssi, br.x, br.y, br.z, br.recorded_at, br.received_at
+		 FROM beacon_readings br
+		 INNER JOIN (
+			SELECT beacon_id, MAX(recorded_at) AS max_ts
+			FROM beacon_readings
+			GROUP BY beacon_id
+		 ) latest ON br.beacon_id = latest.beacon_id AND br.recorded_at = latest.max_ts;`)
+	if err != nil {
+		return nil, fmt.Errorf("latest readings query: %w", err)
+	}
+	defer rows.Close()
+
+	var readings []model.StoredBeaconReading
+	for rows.Next() {
+		var (
+			beaconID      string
+			tagID         string
+			rssi          int
+			x, y, z       float64
+			recordedAtStr string
+			receivedAtStr string
+		)
+		if err := rows.Scan(&beaconID, &tagID, &rssi, &x, &y, &z, &recordedAtStr, &receivedAtStr); err != nil {
+			return nil, fmt.Errorf("scan latest reading: %w", err)
+		}
+
+		recordedAt, err := time.Parse(time.RFC3339Nano, recordedAtStr)
+		if err != nil {
+			recordedAt, _ = time.Parse("2006-01-02T15:04:05Z07:00", recordedAtStr)
+		}
+		receivedAt, err := time.Parse(time.RFC3339Nano, receivedAtStr)
+		if err != nil {
+			receivedAt, _ = time.Parse("2006-01-02T15:04:05Z07:00", receivedAtStr)
+		}
+
+		readings = append(readings, model.StoredBeaconReading{
+			BeaconReading: model.BeaconReading{
+				BeaconID:  beaconID,
+				TagID:     tagID,
+				RSSI:      rssi,
+				Timestamp: recordedAt,
+				BeaconLocation: model.Location{
+					X: x,
+					Y: y,
+					Z: z,
+				},
+			},
+			RecordedAt: recordedAt,
+			ReceivedAt: receivedAt,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest readings: %w", err)
 	}
 
 	return readings, nil

@@ -143,6 +143,30 @@ bool config_portal_has_credentials(void)
     return ready;
 }
 
+esp_err_t config_portal_set_config(const config_portal_config_t *cfg)
+{
+    ESP_RETURN_ON_FALSE(cfg != NULL, ESP_ERR_INVALID_ARG, TAG, "cfg required");
+
+    if (s_config_mutex) {
+        xSemaphoreTakeRecursive(s_config_mutex, portMAX_DELAY);
+    }
+
+    s_config = *cfg;
+    sanitize_config(&s_config);
+    esp_err_t err = save_config_to_nvs();
+
+    if (s_config_mutex) {
+        xSemaphoreGiveRecursive(s_config_mutex);
+    }
+
+    if (err == ESP_OK) {
+        s_config_loaded = true;
+        notify_listeners();
+    }
+
+    return err;
+}
+
 static void sanitize_config(config_portal_config_t *cfg)
 {
     cfg->wifi_ssid[sizeof(cfg->wifi_ssid) - 1] = '\0';

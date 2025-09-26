@@ -47,3 +47,12 @@ type AppConfigEntry struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
+
+// RoomDefinition anchors a semantic room name to coordinates and radius.
+type RoomDefinition struct {
+	Name   string  `json:"name"`
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Z      float64 `json:"z"`
+	Radius float64 `json:"radius"`
+}
