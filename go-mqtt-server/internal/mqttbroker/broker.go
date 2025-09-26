@@ -170,6 +170,16 @@ func (b *Broker) SetPublishHandler(h Handler) {
 	b.handler.Store(h)
 }
 
+// Addr returns the network address the broker is currently bound to.
+func (b *Broker) Addr() net.Addr {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.listener == nil {
+		return nil
+	}
+	return b.listener.Addr()
+}
+
 // Publish sends a QoS 0 message to all clients subscribed to the topic.
 func (b *Broker) Publish(topic string, payload []byte) error {
 	packet, err := buildPublishPacket(topic, payload)

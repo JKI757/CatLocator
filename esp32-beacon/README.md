@@ -28,6 +28,8 @@ idf.py build
 idf.py flash monitor
 ```
 
+On the first build, `idf.py` will pull the official `espressif/mdns` managed component (network required).
+
 ## Serial CLI Provisioning
 If Wi-Fi or MQTT credentials are absent, the firmware stays up and exposes a serial console on the default USB/UART. Connect via `idf.py monitor` (or any serial terminal). The menu lets you:
 

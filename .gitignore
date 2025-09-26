@@ -30,3 +30,4 @@ esp32-beacon/sdkconfig.old
 
 # ML training artifacts
 ml-training/artifacts/
+*.db

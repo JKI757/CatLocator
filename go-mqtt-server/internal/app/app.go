@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -18,6 +19,8 @@ import (
 	"catlocator/go-mqtt-server/internal/model"
 	"catlocator/go-mqtt-server/internal/mqttbroker"
 	"catlocator/go-mqtt-server/internal/store"
+
+	"github.com/grandcat/zeroconf"
 )
 
 // App wires together the CatLocator services and manages their lifecycle.
@@ -26,6 +29,7 @@ type App struct {
 	logger *slog.Logger
 	store  *store.Store
 	broker *mqttbroker.Broker
+	mdns   *zeroconf.Server
 }
 
 // New constructs a new application instance.
@@ -58,6 +62,17 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 	a.broker = broker
+
+	mqttPort := resolveTCPPort(broker.Addr())
+	if mqttPort == 0 {
+		a.logger.Warn("unable to determine MQTT port for mDNS advertisement", "addr", a.cfg.MQTTBindAddress)
+	} else {
+		if err := a.startMDNS(mqttPort); err != nil {
+			a.logger.Warn("mDNS advertisement failed", "error", err)
+		} else {
+			defer a.stopMDNS()
+		}
+	}
 
 	httpErrCh := make(chan error, 1)
 
@@ -958,6 +973,16 @@ func truncateString(s string, max int) string {
 		return s
 	}
 	return string(runes[:max])
+}
+
+func resolveTCPPort(addr net.Addr) int {
+	if addr == nil {
+		return 0
+	}
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		return tcp.Port
+	}
+	return 0
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {

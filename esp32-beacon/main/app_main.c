@@ -11,6 +11,7 @@
 
 #include "ble_scan.h"
 #include "config_portal.h"
+#include "mdns_discovery.h"
 #include "lora_bridge.h"
 #include "mqtt_service.h"
 #include "netmgr.h"
@@ -50,6 +51,7 @@ void app_main(void)
     bool mqtt_ready = true;
     bool ble_ready = true;
     bool lora_ready = true;
+    bool mdns_ready = true;
 
     esp_err_t err = config_portal_init();
     if (err != ESP_OK) {
@@ -61,6 +63,12 @@ void app_main(void)
     if (err != ESP_OK) {
         log_error("netmgr_init", err);
         netmgr_ready = false;
+    }
+
+    err = mdns_discovery_init();
+    if (err != ESP_OK) {
+        log_error("mdns_discovery_init", err);
+        mdns_ready = false;
     }
 
     err = time_sync_init();
@@ -93,6 +101,10 @@ void app_main(void)
 
     if (netmgr_ready) {
         log_error("netmgr_start", netmgr_start());
+    }
+
+    if (mdns_ready) {
+        log_error("mdns_discovery_start", mdns_discovery_start());
     }
 
     if (time_sync_ready) {
