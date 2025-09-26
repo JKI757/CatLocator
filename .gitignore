@@ -22,9 +22,8 @@ pytest_cache/
 go-mqtt-server/go.sum
 
 # ESP-IDF configuration
-esp32-beacon/sdkconfig
 esp32-beacon/sdkconfig.old
-
+esp32-beacon/managed-components
 # Other
 *.log
 
