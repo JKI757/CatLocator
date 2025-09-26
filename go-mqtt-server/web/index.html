@@ -328,8 +328,8 @@
                 <p id="config-message" class="message muted"></p>
             </form>
             <hr>
-            <button type="button" id="wipe-data" class="primary-link" style="background:#cc3333;border-color:#cc3333;">Wipe Telemetry Data</button>
-            <p class="muted">Clears beacon readings, training commands, labels, and ingestion errors. Configuration is preserved.</p>
+            <button type="button" id="wipe-data" class="primary-link" style="background:#cc3333;border-color:#cc3333;">Wipe Database</button>
+            <p class="muted">Clears beacon readings, discovered inventories, training commands, labels, and ingestion errors. Configuration is preserved.</p>
                     <section class="room-definitions">
                 <h3>Room Definitions</h3>
                 <p class="muted">Map rooms to coordinates for triangulation heuristics.</p>
@@ -371,6 +371,8 @@
                     <input type="text" id="assign-target" placeholder="auto-filled from selection">
                 </label>
                 <button type="button" id="assign-refresh">Refresh</button>
+                <button type="button" id="assign-clear" disabled>Clear Beacon ID</button>
+                <button type="button" id="assign-reset" disabled>Reset Beacon</button>
                 <button type="button" id="assign-send" class="primary" disabled>Send Assignment</button>
             </div>
             <p id="assign-detail" class="muted">Select a scanner to view its discoveries.</p>
@@ -442,6 +444,8 @@
         const assignTagSelect = document.getElementById('assign-tag');
         const assignTargetInput = document.getElementById('assign-target');
         const assignRefreshBtn = document.getElementById('assign-refresh');
+        const assignClearBtn = document.getElementById('assign-clear');
+        const assignResetBtn = document.getElementById('assign-reset');
         const assignSendBtn = document.getElementById('assign-send');
         const assignDetail = document.getElementById('assign-detail');
         const assignSummary = document.getElementById('assign-summary');
@@ -731,6 +735,58 @@
             const scanner = getSelectedScanner();
             const target = assignTargetInput ? assignTargetInput.value.trim() : '';
             assignSendBtn.disabled = !scanner || !target;
+            if (assignClearBtn) {
+                assignClearBtn.disabled = !scanner;
+            }
+            if (assignResetBtn) {
+                assignResetBtn.disabled = !scanner;
+            }
+        }
+
+        async function sendScannerAction(action, options = {}) {
+            const scanner = getSelectedScanner();
+            if (!scanner) {
+                if (assignStatus) {
+                    assignStatus.textContent = 'Choose a scanner before sending.';
+                }
+                updateAssignControls();
+                return;
+            }
+
+            if (typeof options.confirm === 'string' && !window.confirm(options.confirm)) {
+                return;
+            }
+
+            const pendingMessage = options.pending || 'Sending command…';
+            const successMessage = options.success || 'Command queued.';
+
+            if (assignStatus) {
+                assignStatus.textContent = pendingMessage;
+            }
+
+            try {
+                const response = await fetch('/api/scanners/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ scanner_id: scanner, action }),
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                if (typeof options.onSuccess === 'function') {
+                    options.onSuccess();
+                }
+                if (assignStatus) {
+                    assignStatus.textContent = successMessage;
+                }
+                refreshDiscovered();
+            } catch (err) {
+                if (assignStatus) {
+                    assignStatus.textContent = `Failed to send command: ${err.message}`;
+                }
+            } finally {
+                updateAssignControls();
+            }
         }
 
         async function refreshDiscovered() {
@@ -995,6 +1051,33 @@
         if (assignRefreshBtn) {
             assignRefreshBtn.addEventListener('click', () => {
                 refreshDiscovered();
+            });
+        }
+        if (assignClearBtn) {
+            assignClearBtn.addEventListener('click', () => {
+                sendScannerAction('clear', {
+                    pending: 'Clearing beacon ID…',
+                    success: 'Beacon ID cleared.',
+                    onSuccess: () => {
+                        if (assignTargetInput) {
+                            assignTargetInput.value = '';
+                        }
+                        if (assignTagSelect) {
+                            assignTagSelect.value = '';
+                        }
+                        applySuggestedTarget(null);
+                        renderAssignDetail();
+                    },
+                });
+            });
+        }
+        if (assignResetBtn) {
+            assignResetBtn.addEventListener('click', () => {
+                sendScannerAction('reset', {
+                    pending: 'Sending reset command…',
+                    success: 'Reset command queued.',
+                    confirm: 'Resetting will reboot the scanner. Continue?',
+                });
             });
         }
         if (assignSendBtn) {

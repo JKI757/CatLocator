@@ -338,6 +338,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/api/admin/wipe", a.handleWipeDatabase)
 	mux.HandleFunc("/api/location/cat", a.handleCatLocation)
 	mux.HandleFunc("/api/scanners/discovered", a.handleDiscoveredScanners)
+	mux.HandleFunc("/api/scanners/control", a.handleScannerControl)
 	mux.HandleFunc("/api/scanners/assign", a.handleAssignScanner)
 	mux.HandleFunc("/static/", func(w http.ResponseWriter, r *http.Request) {
 		http.StripPrefix("/static/", http.FileServer(http.Dir("web"))).ServeHTTP(w, r)
@@ -469,15 +470,40 @@ func (a *App) handleDiscoveredScanners(w http.ResponseWriter, r *http.Request) {
 	}{Discovered: beacons})
 }
 
+func (a *App) publishScannerCommand(scannerID string, command map[string]interface{}) error {
+	if a.broker == nil {
+		return fmt.Errorf("mqtt broker not initialized")
+	}
+
+	scannerID = strings.TrimSpace(scannerID)
+	if scannerID == "" {
+		return fmt.Errorf("scanner_id required")
+	}
+
+	if command == nil {
+		return fmt.Errorf("command payload required")
+	}
+
+	if _, exists := command["timestamp"]; !exists {
+		command["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	data, err := json.Marshal(command)
+	if err != nil {
+		return fmt.Errorf("marshal command: %w", err)
+	}
+
+	topic := fmt.Sprintf("scanners/%s/control", scannerID)
+	if err := a.broker.Publish(topic, data); err != nil {
+		return fmt.Errorf("publish command: %w", err)
+	}
+	return nil
+}
+
 func (a *App) handleAssignScanner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if a.broker == nil {
-		http.Error(w, "mqtt broker not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -502,27 +528,67 @@ func (a *App) handleAssignScanner(w http.ResponseWriter, r *http.Request) {
 	command := map[string]interface{}{
 		"command":   "assign",
 		"beacon_id": payload.BeaconID,
-		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if payload.Location != nil {
 		command["location"] = payload.Location
 	}
 
-	data, err := json.Marshal(command)
-	if err != nil {
-		a.logger.Error("assign marshal failed", "error", err)
-		http.Error(w, "failed to marshal command", http.StatusInternalServerError)
-		return
-	}
-
-	topic := fmt.Sprintf("scanners/%s/control", payload.ScannerID)
-	if err := a.broker.Publish(topic, data); err != nil {
-		a.logger.Error("assign publish failed", "topic", topic, "error", err)
+	if err := a.publishScannerCommand(payload.ScannerID, command); err != nil {
+		a.logger.Error("assign publish failed", "scanner", payload.ScannerID, "error", err)
 		http.Error(w, "failed to publish command", http.StatusInternalServerError)
 		return
 	}
 
 	a.logger.Info("scanner assign command sent", "scanner", payload.ScannerID, "beacon", payload.BeaconID)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
+}
+
+func (a *App) handleScannerControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload struct {
+		ScannerID string `json:"scanner_id"`
+		Action    string `json:"action"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	payload.ScannerID = strings.TrimSpace(payload.ScannerID)
+	payload.Action = strings.TrimSpace(strings.ToLower(payload.Action))
+	if payload.ScannerID == "" || payload.Action == "" {
+		http.Error(w, "scanner_id and action are required", http.StatusBadRequest)
+		return
+	}
+
+	var command map[string]interface{}
+	switch payload.Action {
+	case "clear", "clear_beacon", "clear-beacon", "clear-id", "clear_id":
+		command = map[string]interface{}{"command": "clear"}
+	case "reset", "reboot":
+		command = map[string]interface{}{"command": "reset"}
+	case "state":
+		command = map[string]interface{}{"command": "state"}
+	default:
+		http.Error(w, "unsupported action", http.StatusBadRequest)
+		return
+	}
+
+	if err := a.publishScannerCommand(payload.ScannerID, command); err != nil {
+		a.logger.Error("scanner control failed", "scanner", payload.ScannerID, "action", payload.Action, "error", err)
+		http.Error(w, "failed to publish command", http.StatusInternalServerError)
+		return
+	}
+
+	a.logger.Info("scanner control command sent", "scanner", payload.ScannerID, "action", command["command"])
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"status": "queued"})

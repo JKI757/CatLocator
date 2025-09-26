@@ -7,10 +7,13 @@
 #include <time.h>
 
 #include "config_portal.h"
+#include "device_info.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "mqtt_service.h"
 
 #include "host/ble_gap.h"
@@ -27,6 +30,7 @@ static bool s_scan_started;
 static config_portal_config_t s_latest_cfg;
 static uint32_t s_reporting_interval_ms = 5000;
 static bool s_debug_logging;
+static int64_t s_last_missing_beacon_log_us;
 
 typedef struct {
     uint8_t addr[6];
@@ -37,11 +41,31 @@ typedef struct {
 #define TAG_CACHE_MAX 32
 static tag_cache_entry_t s_tag_cache[TAG_CACHE_MAX];
 
+typedef struct {
+    char topic[160];
+    char payload[512];
+} ble_publish_msg_t;
+
+static QueueHandle_t s_publish_queue;
+static TaskHandle_t s_publish_task;
+
 static void ble_host_task(void *param);
 static void start_scan(void);
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
 static void format_address(const uint8_t *addr, char *out, size_t len);
 static void publish_reading(const struct ble_gap_disc_desc *desc);
+static void publish_discovery(const struct ble_gap_disc_desc *desc,
+                              const char *addr,
+                              const char *tag_name,
+                              int rssi,
+                              uint16_t manufacturer_id,
+                              const char *manufacturer_data,
+                              bool tx_power_present,
+                              int tx_power_dbm,
+                              const char *event_type,
+                              int64_t timestamp_us);
+static void publish_task(void *param);
+static void enqueue_publish(const char *topic, const char *payload);
 static void config_listener(const config_portal_config_t *cfg, void *ctx);
 static tag_cache_entry_t *find_cache_entry(const uint8_t *addr);
 static tag_cache_entry_t *allocate_cache_entry(const uint8_t *addr);
@@ -85,6 +109,22 @@ esp_err_t ble_scan_init(void)
         BaseType_t created = xTaskCreate(debug_log_task, "ble_debug", 4096, NULL, tskIDLE_PRIORITY + 2, &s_debug_task);
         if (created != pdPASS) {
             ESP_LOGE(TAG, "Failed to create debug log task");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!s_publish_queue) {
+        s_publish_queue = xQueueCreate(16, sizeof(ble_publish_msg_t));
+        if (!s_publish_queue) {
+            ESP_LOGE(TAG, "Failed to create publish queue");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!s_publish_task) {
+        BaseType_t created = xTaskCreate(publish_task, "ble_publish", 4096, NULL, tskIDLE_PRIORITY + 2, &s_publish_task);
+        if (created != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create publish task");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -236,10 +276,6 @@ static bool should_publish(tag_cache_entry_t *entry, int64_t now_us)
 
 static void publish_reading(const struct ble_gap_disc_desc *desc)
 {
-    if (s_latest_cfg.beacon_id[0] == '\0') {
-        return;
-    }
-
     int64_t now_us = esp_timer_get_time();
     tag_cache_entry_t *entry = find_cache_entry(desc->addr.val);
     if (!entry) {
@@ -287,6 +323,25 @@ static void publish_reading(const struct ble_gap_disc_desc *desc)
     char timestamp[32];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
 
+    if (s_latest_cfg.beacon_id[0] == '\0') {
+        if (now_us - s_last_missing_beacon_log_us > 5 * 1000 * 1000) {
+            ESP_LOGW(TAG, "Beacon ID not configured; sending discovery inventory only");
+            s_last_missing_beacon_log_us = now_us;
+        }
+
+        publish_discovery(desc,
+                          addr,
+                          tag_name,
+                          desc->rssi,
+                          manufacturer_id,
+                          manufacturer_data,
+                          fields_valid && fields.tx_pwr_lvl_is_present,
+                          fields.tx_pwr_lvl,
+                          event_type_str(desc->event_type),
+                          now_us);
+        return;
+    }
+
     char topic[128];
     snprintf(topic, sizeof(topic), "beacons/%s/readings", s_latest_cfg.beacon_id);
 
@@ -325,10 +380,71 @@ static void publish_reading(const struct ble_gap_disc_desc *desc)
         ESP_LOGW(TAG, "Payload truncated for tag %s", addr);
     }
 
-    esp_err_t err = mqtt_service_publish(topic, payload);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to publish reading: %s", esp_err_to_name(err));
+    enqueue_publish(topic, payload);
+}
+
+static void publish_discovery(const struct ble_gap_disc_desc *desc,
+                              const char *addr,
+                              const char *tag_name,
+                              int rssi,
+                              uint16_t manufacturer_id,
+                              const char *manufacturer_data,
+                              bool tx_power_present,
+                              int tx_power_dbm,
+                              const char *event_type,
+                              int64_t timestamp_us)
+{
+    (void)desc;
+    const char *scanner_id = device_info_scanner_id();
+
+    char topic[160];
+    snprintf(topic, sizeof(topic), "scanners/%s/inventory", scanner_id);
+
+    time_t seconds = timestamp_us / 1000000;
+    struct tm tm_info = {0};
+    gmtime_r(&seconds, &tm_info);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+
+    const char *name_for_payload = (tag_name && tag_name[0]) ? tag_name : addr;
+
+    char payload[512];
+    int written = snprintf(payload, sizeof(payload),
+                           "{\"scanner_id\":\"%s\",\"tag_address\":\"%s\",\"tag_name\":\"%s\",\"rssi\":%d,\"timestamp\":\"%s\"",
+                           scanner_id,
+                           addr,
+                           name_for_payload,
+                           rssi,
+                           timestamp);
+
+    if (manufacturer_id != 0xFFFF) {
+        written += snprintf(payload + written, sizeof(payload) - written,
+                             ",\"manufacturer_id\":%u",
+                             manufacturer_id);
     }
+    if (manufacturer_data && manufacturer_data[0] != '\0') {
+        written += snprintf(payload + written, sizeof(payload) - written,
+                             ",\"manufacturer_data\":\"%s\"",
+                             manufacturer_data);
+    }
+    if (tx_power_present) {
+        written += snprintf(payload + written, sizeof(payload) - written,
+                             ",\"tx_power\":%d",
+                             tx_power_dbm);
+    }
+    if (event_type && event_type[0] != '\0') {
+        written += snprintf(payload + written, sizeof(payload) - written,
+                             ",\"event_type\":\"%s\"",
+                             event_type);
+    }
+
+    written += snprintf(payload + written, sizeof(payload) - written, "}");
+
+    if (written < 0 || written >= (int)sizeof(payload)) {
+        ESP_LOGW(TAG, "Discovery payload truncated for %s", addr);
+    }
+
+    enqueue_publish(topic, payload);
 }
 
 static void format_address(const uint8_t *addr, char *out, size_t len)
@@ -446,6 +562,45 @@ static void debug_log_advert(const struct ble_gap_disc_desc *desc)
                      uuid->value[7], uuid->value[6], uuid->value[5], uuid->value[4],
                      uuid->value[3], uuid->value[2], uuid->value[1], uuid->value[0]);
         }
+    }
+}
+
+static void publish_task(void *param)
+{
+    ble_publish_msg_t msg;
+    while (true) {
+        if (xQueueReceive(s_publish_queue, &msg, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        esp_err_t err = mqtt_service_publish(msg.topic, msg.payload);
+        if (err == ESP_OK) {
+            if (s_debug_logging) {
+                ESP_LOGD(TAG, "Published MQTT message topic=%s", msg.topic);
+            }
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "MQTT not ready; retrying topic=%s", msg.topic);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            enqueue_publish(msg.topic, msg.payload);
+        } else {
+            ESP_LOGW(TAG, "Failed to publish MQTT message (topic=%s err=%s)", msg.topic, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+    }
+}
+
+static void enqueue_publish(const char *topic, const char *payload)
+{
+    if (!topic || !payload || !s_publish_queue) {
+        return;
+    }
+
+    ble_publish_msg_t msg = {0};
+    strlcpy(msg.topic, topic, sizeof(msg.topic));
+    strlcpy(msg.payload, payload, sizeof(msg.payload));
+
+    if (xQueueSend(s_publish_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Publish queue full; dropping message for %s", msg.topic);
     }
 }
 

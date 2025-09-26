@@ -469,6 +469,7 @@ func (s *Store) WipeData(ctx context.Context) error {
 		`DELETE FROM training_commands;`,
 		`DELETE FROM room_labels;`,
 		`DELETE FROM room_models;`,
+		`DELETE FROM discovered_beacons;`,
 	}
 
 	for _, stmt := range stmts {

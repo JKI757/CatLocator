@@ -4,6 +4,8 @@ set(srcs
     "netmgr/netmgr.c"
     "time_sync/time_sync.c"
     "mqtt_service/mqtt_service.c"
+    "device_info/device_info.c"
+    "control/beacon_control.c"
     "mdns_discovery/mdns_discovery.c"
     "ble_scan/ble_scan.c"
     "lora_bridge/lora_bridge.c"

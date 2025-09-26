@@ -9,8 +9,10 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 
+#include "beacon_control.h"
 #include "ble_scan.h"
 #include "config_portal.h"
+#include "device_info.h"
 #include "mdns_discovery.h"
 #include "lora_bridge.h"
 #include "mqtt_service.h"
@@ -52,6 +54,7 @@ void app_main(void)
     bool ble_ready = true;
     bool lora_ready = true;
     bool mdns_ready = true;
+    bool device_info_ready = true;
 
     esp_err_t err = config_portal_init();
     if (err != ESP_OK) {
@@ -63,6 +66,12 @@ void app_main(void)
     if (err != ESP_OK) {
         log_error("netmgr_init", err);
         netmgr_ready = false;
+    }
+
+    err = device_info_init();
+    if (err != ESP_OK) {
+        log_error("device_info_init", err);
+        device_info_ready = false;
     }
 
     err = mdns_discovery_init();
@@ -81,6 +90,13 @@ void app_main(void)
     if (err != ESP_OK) {
         log_error("mqtt_service_init", err);
         mqtt_ready = false;
+    }
+
+    if (mqtt_ready && device_info_ready) {
+        err = beacon_control_init();
+        if (err != ESP_OK) {
+            log_error("beacon_control_init", err);
+        }
     }
 
     err = ble_scan_init();

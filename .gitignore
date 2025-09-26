@@ -29,4 +29,5 @@ esp32-beacon/managed-components
 
 # ML training artifacts
 ml-training/artifacts/
+
 *.db

@@ -1,5 +1,6 @@
 #include "mdns_discovery.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,7 @@ static bool info_from_result(const mdns_result_t *result, mdns_discovery_info_t 
 static bool info_equal(const mdns_discovery_info_t *a, const mdns_discovery_info_t *b);
 static bool string_truthy(const char *value);
 static void notify_listener(const mdns_discovery_info_t *info);
+static void normalize_hostname(char *hostname);
 
 esp_err_t mdns_discovery_init(void)
 {
@@ -151,8 +153,8 @@ static void discovery_task(void *arg)
     for (;;) {
         xEventGroupWaitBits(s_event_group, MDNS_DISCOVERY_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
-    mdns_result_t *results = NULL;
-    esp_err_t err = mdns_query_ptr("_catlocator", "_tcp", 3000, 8, &results);
+        mdns_result_t *results = NULL;
+        esp_err_t err = mdns_query_ptr("_catlocator", "_tcp", 3000, 8, &results);
         if (err != ESP_OK) {
             if (err != ESP_ERR_NOT_FOUND) {
                 ESP_LOGW(TAG, "mdns query failed: %s", esp_err_to_name(err));
@@ -200,6 +202,7 @@ static void notify_listener(const mdns_discovery_info_t *info)
     xSemaphoreGive(s_lock);
 
     if (listener && changed) {
+        ESP_LOGI(TAG, "Discovered CatLocator service (%s)", snapshot.uri);
         listener(&snapshot, ctx);
     }
 }
@@ -267,25 +270,26 @@ static bool info_from_result(const mdns_result_t *result, mdns_discovery_info_t 
         }
     }
 
-    const char *host_for_uri = addrbuf[0] ? addrbuf : hostbuf;
-    if (!host_for_uri[0]) {
+    normalize_hostname(hostbuf);
+
+    const char *uri_host = addrbuf[0] ? addrbuf : hostbuf;
+    if (!uri_host[0]) {
         ESP_LOGW(TAG, "mdns result missing hostname/address");
         return false;
     }
 
     const char *scheme = tls ? "mqtts" : "mqtt";
 
-    if (!addrbuf[0] && hostbuf[0] && strchr(host_for_uri, '.') == NULL) {
-        snprintf(out_info->uri, sizeof(out_info->uri), "%s://%s.local:%u", scheme, host_for_uri, port);
-    } else {
-        snprintf(out_info->uri, sizeof(out_info->uri), "%s://%s:%u", scheme, host_for_uri, port);
-    }
+    snprintf(out_info->uri, sizeof(out_info->uri), "%s://%s:%u", scheme, uri_host, port);
 
-    strlcpy(out_info->hostname, hostbuf[0] ? hostbuf : host_for_uri, sizeof(out_info->hostname));
+    if (hostbuf[0]) {
+        strlcpy(out_info->hostname, hostbuf, sizeof(out_info->hostname));
+    } else {
+        strlcpy(out_info->hostname, uri_host, sizeof(out_info->hostname));
+    }
     out_info->port = port;
     out_info->tls = tls;
 
-    ESP_LOGI(TAG, "Discovered CatLocator service (%s)", out_info->uri);
     return true;
 }
 
@@ -322,4 +326,33 @@ static bool string_truthy(const char *value)
         return true;
     }
     return false;
+}
+
+static void normalize_hostname(char *hostname)
+{
+    if (!hostname) {
+        return;
+    }
+
+    size_t len = strlen(hostname);
+    while (len > 0 && (hostname[len - 1] == '.' || hostname[len - 1] == ' ')) {
+        hostname[len - 1] = '\0';
+        len--;
+    }
+
+    for (size_t i = 0; i < len; ++i) {
+        if (hostname[i] == ' ') {
+            hostname[i] = '-';
+        } else {
+            hostname[i] = (char)tolower((unsigned char)hostname[i]);
+        }
+    }
+
+    if (len == 0) {
+        return;
+    }
+
+    if (strstr(hostname, ".") == NULL) {
+        strlcat(hostname, ".local", 64);
+    }
 }
