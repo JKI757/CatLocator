@@ -101,6 +101,18 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		);`,
+		`CREATE TABLE IF NOT EXISTS discovered_beacons (
+			scanner_id TEXT NOT NULL,
+			tag_address TEXT NOT NULL,
+			tag_name TEXT,
+			rssi INTEGER,
+			manufacturer_id INTEGER,
+			manufacturer_data TEXT,
+			tx_power INTEGER,
+			event_type TEXT,
+			last_seen TEXT NOT NULL,
+			PRIMARY KEY (scanner_id, tag_address)
+		);`,
 	}
 
 	for _, stmt := range stmts {
@@ -238,6 +250,120 @@ func (s *Store) RecentBeaconReadings(ctx context.Context, limit int, since *time
 	}
 
 	return readings, nil
+}
+
+// UpsertDiscoveredBeacon records or updates metadata for a beacon observed during discovery mode.
+func (s *Store) UpsertDiscoveredBeacon(ctx context.Context, beacon model.DiscoveredBeacon) error {
+	if s.db == nil {
+		return fmt.Errorf("store not initialized")
+	}
+
+	if beacon.LastSeen.IsZero() {
+		beacon.LastSeen = time.Now().UTC()
+	}
+
+	var manufacturerID sql.NullInt64
+	if beacon.ManufacturerID != nil {
+		manufacturerID = sql.NullInt64{Int64: int64(*beacon.ManufacturerID), Valid: true}
+	}
+
+	var txPower sql.NullInt64
+	if beacon.TxPower != nil {
+		txPower = sql.NullInt64{Int64: int64(*beacon.TxPower), Valid: true}
+	}
+
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO discovered_beacons (scanner_id, tag_address, tag_name, rssi, manufacturer_id, manufacturer_data, tx_power, event_type, last_seen)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(scanner_id, tag_address)
+		 DO UPDATE SET tag_name = excluded.tag_name,
+				 rssi = excluded.rssi,
+				 manufacturer_id = excluded.manufacturer_id,
+				 manufacturer_data = excluded.manufacturer_data,
+				 tx_power = excluded.tx_power,
+				 event_type = excluded.event_type,
+				 last_seen = excluded.last_seen;`,
+		beacon.ScannerID,
+		beacon.TagAddress,
+		beacon.TagName,
+		beacon.RSSI,
+		manufacturerID,
+		beacon.ManufacturerData,
+		txPower,
+		beacon.EventType,
+		beacon.LastSeen.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert discovered beacon: %w", err)
+	}
+	return nil
+}
+
+// ListDiscoveredBeacons returns the set of recently seen beacons published during discovery mode.
+func (s *Store) ListDiscoveredBeacons(ctx context.Context) ([]model.DiscoveredBeacon, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("store not initialized")
+	}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT scanner_id, tag_address, tag_name, rssi, manufacturer_id, manufacturer_data, tx_power, event_type, last_seen FROM discovered_beacons ORDER BY last_seen DESC;`)
+	if err != nil {
+		return nil, fmt.Errorf("query discovered beacons: %w", err)
+	}
+	defer rows.Close()
+
+	var beacons []model.DiscoveredBeacon
+
+	for rows.Next() {
+		var (
+			scannerID       string
+			tagAddress      string
+			tagName         sql.NullString
+			rssi            sql.NullInt64
+			manufacturerID  sql.NullInt64
+			manufacturerRaw sql.NullString
+			txPower         sql.NullInt64
+			eventType       sql.NullString
+			lastSeenStr     string
+		)
+
+		if err := rows.Scan(&scannerID, &tagAddress, &tagName, &rssi, &manufacturerID, &manufacturerRaw, &txPower, &eventType, &lastSeenStr); err != nil {
+			return nil, fmt.Errorf("scan discovered beacon: %w", err)
+		}
+
+		lastSeen, err := time.Parse(time.RFC3339Nano, lastSeenStr)
+		if err != nil {
+			lastSeen, _ = time.Parse("2006-01-02T15:04:05Z07:00", lastSeenStr)
+		}
+
+		beacon := model.DiscoveredBeacon{
+			ScannerID:        scannerID,
+			TagAddress:       tagAddress,
+			RSSI:             int(rssi.Int64),
+			ManufacturerData: manufacturerRaw.String,
+			EventType:        eventType.String,
+			LastSeen:         lastSeen,
+		}
+		if tagName.Valid {
+			beacon.TagName = tagName.String
+		}
+		if manufacturerID.Valid {
+			id := int(manufacturerID.Int64)
+			beacon.ManufacturerID = &id
+		}
+		if txPower.Valid {
+			power := int(txPower.Int64)
+			beacon.TxPower = &power
+		}
+
+		beacons = append(beacons, beacon)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate discovered beacons: %w", err)
+	}
+
+	return beacons, nil
 }
 
 // UpsertAppConfig stores or updates a configuration key/value pair.

@@ -26,12 +26,18 @@ func (a *App) startMDNS(port int) error {
 	}
 
 	instance := sanitizeMDNSInstance(fmt.Sprintf("CatLocator Server (%s)", hostname))
+	hostLabel := sanitizeMDNSHost(hostname)
+	hostFQDN := hostLabel
+	if !strings.Contains(hostFQDN, ".") {
+		hostFQDN = hostLabel + ".local"
+	}
 
 	txt := []string{
 		fmt.Sprintf("mqtt_port=%d", port),
 		fmt.Sprintf("http_port=%d", a.cfg.HTTPPort),
 		"tls=0",
 		"proto=v1",
+		fmt.Sprintf("host=%s", hostFQDN),
 	}
 
 	server, err := zeroconf.Register(instance, mdnsServiceType, mdnsDomain, port, txt, nil)
@@ -67,6 +73,21 @@ func sanitizeMDNSInstance(name string) string {
 	const maxLen = 63
 	if len(runes) > maxLen {
 		cleaned = string(runes[:maxLen])
+	}
+	return cleaned
+}
+
+func sanitizeMDNSHost(name string) string {
+	cleaned := strings.TrimSpace(strings.ToLower(name))
+	replacer := strings.NewReplacer(" ", "-", "_", "-", "\n", "", "\r", "")
+	cleaned = replacer.Replace(cleaned)
+	if cleaned == "" {
+		cleaned = "catlocator"
+	}
+	// Host labels must be <=63 characters.
+	irunes := []rune(cleaned)
+	if len(irunes) > 63 {
+		cleaned = string(irunes[:63])
 	}
 	return cleaned
 }

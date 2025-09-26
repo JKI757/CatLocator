@@ -105,6 +105,16 @@
             font-size: 0.9rem;
         }
         .controls button.primary {
+            border-color: #335dff;
+            background: #335dff;
+            color: #fff;
+        }
+        .controls select {
+            margin-top: 0.25rem;
+            padding: 0.3rem 0.4rem;
+            border-radius: 0.35rem;
+            border: 1px solid #999;
+        }
         .location-display {
             display: flex;
             flex-direction: column;
@@ -341,6 +351,34 @@
 
     <section id="view-beacon" class="view">
         <article class="card">
+            <h2>Target Beacon Assignment</h2>
+            <p>Select a recently discovered tag and push its identifier to an online scanner.</p>
+            <div class="assign-controls controls">
+                <label>
+                    Scanner
+                    <select id="assign-scanner">
+                        <option value="">Select scanner…</option>
+                    </select>
+                </label>
+                <label>
+                    Tag Address
+                    <select id="assign-tag" disabled>
+                        <option value="">Select scanner first…</option>
+                    </select>
+                </label>
+                <label>
+                    Target Beacon ID
+                    <input type="text" id="assign-target" placeholder="auto-filled from selection">
+                </label>
+                <button type="button" id="assign-refresh">Refresh</button>
+                <button type="button" id="assign-send" class="primary" disabled>Send Assignment</button>
+            </div>
+            <p id="assign-detail" class="muted">Select a scanner to view its discoveries.</p>
+            <p id="assign-summary" class="muted"></p>
+            <p id="assign-status" class="message muted"></p>
+            <div id="assign-table" class="scroll-table" style="max-height:220px;"></div>
+        </article>
+        <article class="card">
             <h2>Beacon Command Console</h2>
             <p>Send JSON commands to connected beacons. Leave the topic blank to target <code>beacons/&lt;beacon_id&gt;/commands</code>.</p>
             <form id="beacon-form">
@@ -400,6 +438,16 @@
         const catRoomMatchesEl = document.getElementById('cat-room-matches');
         const refreshLocationBtn = document.getElementById('refresh-location');
 
+        const assignScannerSelect = document.getElementById('assign-scanner');
+        const assignTagSelect = document.getElementById('assign-tag');
+        const assignTargetInput = document.getElementById('assign-target');
+        const assignRefreshBtn = document.getElementById('assign-refresh');
+        const assignSendBtn = document.getElementById('assign-send');
+        const assignDetail = document.getElementById('assign-detail');
+        const assignSummary = document.getElementById('assign-summary');
+        const assignStatus = document.getElementById('assign-status');
+        const assignTable = document.getElementById('assign-table');
+
         const beaconForm = document.getElementById('beacon-form');
         const beaconMessage = document.getElementById('beacon-message');
         const beaconIdInput = document.getElementById('beacon-id');
@@ -436,6 +484,9 @@
         let tagFilter = '';
         const MAX_READINGS = 200;
         let sinceToken = null;
+        let discoveredBeacons = [];
+        let discoveredPollHandle = null;
+        let lastSuggestedTarget = '';
 
         function readingKey(reading) {
             const received = reading.received_at || reading.recorded_at || '';
@@ -505,6 +556,241 @@
                         <td>${cmd.source || ''}</td>
                     </tr>`);
             commandsBody.innerHTML = rows.join('');
+        }
+
+        function getSelectedScanner() {
+            return assignScannerSelect && assignScannerSelect.value ? assignScannerSelect.value : '';
+        }
+
+        function getSelectedTagEntry() {
+            if (!assignTagSelect) {
+                return null;
+            }
+            const value = assignTagSelect.value;
+            if (!value) {
+                return null;
+            }
+            const scanner = getSelectedScanner();
+            return (
+                discoveredBeacons.find(
+                    (item) => item.tag_address === value && (!scanner || item.scanner_id === scanner)
+                ) || null
+            );
+        }
+
+        function renderScannerOptions(preferred) {
+            if (!assignScannerSelect) {
+                return;
+            }
+            const current = typeof preferred === 'string' ? preferred : assignScannerSelect.value;
+            const scanners = Array.from(new Set(discoveredBeacons.map((item) => item.scanner_id)))
+                .filter(Boolean)
+                .sort((a, b) => a.localeCompare(b));
+            const options = ['<option value="">Select scanner…</option>'];
+            scanners.forEach((scanner) => {
+                options.push(`<option value="${scanner}">${scanner}</option>`);
+            });
+            assignScannerSelect.innerHTML = options.join('');
+            if (current && scanners.includes(current)) {
+                assignScannerSelect.value = current;
+            }
+        }
+
+        function renderTagOptions(preferred) {
+            if (!assignTagSelect) {
+                return;
+            }
+            const scanner = getSelectedScanner();
+            const current = typeof preferred === 'string' ? preferred : assignTagSelect.value;
+            if (!scanner) {
+                assignTagSelect.innerHTML = '<option value="">Select scanner first…</option>';
+                assignTagSelect.disabled = true;
+                applySuggestedTarget(null);
+                return;
+            }
+            const filtered = discoveredBeacons
+                .filter((item) => item.scanner_id === scanner)
+                .sort((a, b) => Date.parse(b.last_seen || 0) - Date.parse(a.last_seen || 0));
+            if (!filtered.length) {
+                assignTagSelect.innerHTML = '<option value="">No tags discovered yet…</option>';
+                assignTagSelect.disabled = true;
+                applySuggestedTarget(null);
+                return;
+            }
+            const options = ['<option value="">Select tag…</option>'];
+            filtered.forEach((item) => {
+                const label = item.tag_name ? `${item.tag_name} (${item.tag_address})` : item.tag_address;
+                options.push(`<option value="${item.tag_address}">${label}</option>`);
+            });
+            assignTagSelect.innerHTML = options.join('');
+            assignTagSelect.disabled = false;
+            if (current && filtered.some((item) => item.tag_address === current)) {
+                assignTagSelect.value = current;
+            } else {
+                assignTagSelect.value = '';
+            }
+        }
+
+        function renderDiscoveredTable() {
+            if (!assignTable) {
+                return;
+            }
+            if (!discoveredBeacons.length) {
+                assignTable.innerHTML = '<div class="muted">No discovered beacons yet.</div>';
+                return;
+            }
+            const scanner = getSelectedScanner();
+            const filtered = scanner
+                ? discoveredBeacons.filter((item) => item.scanner_id === scanner)
+                : discoveredBeacons.slice();
+            if (!filtered.length) {
+                assignTable.innerHTML = '<div class="muted">No discoveries for this scanner yet.</div>';
+                return;
+            }
+            const rows = filtered
+                .slice()
+                .sort((a, b) => Date.parse(b.last_seen || 0) - Date.parse(a.last_seen || 0))
+                .map((item) => {
+                    const name = item.tag_name || '—';
+                    const event = item.event_type || '—';
+                    const lastSeen = item.last_seen ? new Date(item.last_seen).toLocaleTimeString() : '—';
+                    const manufacturer =
+                        typeof item.manufacturer_id === 'number'
+                            ? `0x${item.manufacturer_id.toString(16).toUpperCase().padStart(4, '0')}`
+                            : '—';
+                    const rssi = typeof item.rssi === 'number' ? item.rssi : '—';
+                    return `<tr>
+                        <td>${item.tag_address}</td>
+                        <td>${name}</td>
+                        <td>${rssi}</td>
+                        <td>${event}</td>
+                        <td>${lastSeen}</td>
+                        <td>${manufacturer}</td>
+                    </tr>`;
+                });
+            assignTable.innerHTML = `<table>
+                    <thead>
+                        <tr>
+                            <th>Tag</th>
+                            <th>Name</th>
+                            <th>RSSI</th>
+                            <th>Event</th>
+                            <th>Last Seen</th>
+                            <th>Manufacturer</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows.join('')}</tbody>
+                </table>`;
+        }
+
+        function applySuggestedTarget(tag) {
+            if (!assignTargetInput) {
+                return;
+            }
+            const suggestion = tag
+                ? (tag.tag_name && tag.tag_name.trim() ? tag.tag_name.trim() : tag.tag_address)
+                : '';
+            const current = assignTargetInput.value;
+            if (!tag) {
+                if (current === lastSuggestedTarget) {
+                    assignTargetInput.value = '';
+                }
+                lastSuggestedTarget = '';
+                return;
+            }
+            if (!current || current === lastSuggestedTarget) {
+                assignTargetInput.value = suggestion;
+            }
+            lastSuggestedTarget = suggestion;
+        }
+
+        function renderAssignDetail() {
+            if (!assignDetail) {
+                return;
+            }
+            const scanner = getSelectedScanner();
+            if (!scanner) {
+                assignDetail.textContent = 'Select a scanner to view its discoveries.';
+                return;
+            }
+            const tag = getSelectedTagEntry();
+            if (!tag) {
+                assignDetail.textContent = 'Select a tag to assign as the target beacon ID.';
+                return;
+            }
+            const lastSeen = tag.last_seen ? new Date(tag.last_seen).toLocaleTimeString() : 'recently';
+            const label = tag.tag_name ? `${tag.tag_name} (${tag.tag_address})` : tag.tag_address;
+            const rssi = typeof tag.rssi === 'number' ? tag.rssi : '—';
+            assignDetail.textContent = `Ready to assign ${label} (RSSI ${rssi}) to ${scanner}. Last seen ${lastSeen}.`;
+        }
+
+        function updateAssignControls() {
+            if (!assignSendBtn) {
+                return;
+            }
+            const scanner = getSelectedScanner();
+            const target = assignTargetInput ? assignTargetInput.value.trim() : '';
+            assignSendBtn.disabled = !scanner || !target;
+        }
+
+        async function refreshDiscovered() {
+            if (!assignScannerSelect || !assignTable) {
+                return;
+            }
+            const preferredScanner = getSelectedScanner();
+            const preferredTag = assignTagSelect ? assignTagSelect.value : '';
+            if (assignRefreshBtn) {
+                assignRefreshBtn.disabled = true;
+            }
+            try {
+                const response = await fetch('/api/scanners/discovered');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                discoveredBeacons = Array.isArray(payload.discovered) ? payload.discovered : [];
+                renderScannerOptions(preferredScanner);
+                renderTagOptions(preferredTag);
+                renderDiscoveredTable();
+                const tag = getSelectedTagEntry();
+                applySuggestedTarget(tag);
+                renderAssignDetail();
+                updateAssignControls();
+                if (assignSummary) {
+                    if (discoveredBeacons.length) {
+                        assignSummary.textContent = `Last refresh ${new Date().toLocaleTimeString()} (${discoveredBeacons.length} tag(s) total).`;
+                    } else {
+                        assignSummary.textContent = 'No discovered beacons yet.';
+                    }
+                }
+            } catch (err) {
+                if (assignStatus) {
+                    assignStatus.textContent = `Failed to load discovered beacons: ${err.message}`;
+                }
+            } finally {
+                if (assignRefreshBtn) {
+                    assignRefreshBtn.disabled = false;
+                }
+                updateAssignControls();
+            }
+        }
+
+        function startDiscoveredPolling() {
+            if (!assignScannerSelect) {
+                return;
+            }
+            refreshDiscovered();
+            if (discoveredPollHandle) {
+                clearInterval(discoveredPollHandle);
+            }
+            discoveredPollHandle = setInterval(refreshDiscovered, 7000);
+        }
+
+        function stopDiscoveredPolling() {
+            if (discoveredPollHandle) {
+                clearInterval(discoveredPollHandle);
+                discoveredPollHandle = null;
+            }
         }
 
         function ingestReadings(readings) {
@@ -677,6 +963,86 @@
             refreshLocationBtn.addEventListener('click', fetchLocation);
         }
 
+        if (assignTable) {
+            assignTable.innerHTML = '<div class="muted">No discovered beacons yet.</div>';
+        }
+        if (assignSummary) {
+            assignSummary.textContent = '';
+        }
+        if (assignScannerSelect) {
+            assignScannerSelect.addEventListener('change', () => {
+                renderTagOptions();
+                renderDiscoveredTable();
+                const tag = getSelectedTagEntry();
+                applySuggestedTarget(tag);
+                renderAssignDetail();
+                updateAssignControls();
+            });
+        }
+        if (assignTagSelect) {
+            assignTagSelect.addEventListener('change', () => {
+                const tag = getSelectedTagEntry();
+                applySuggestedTarget(tag);
+                renderAssignDetail();
+                updateAssignControls();
+            });
+        }
+        if (assignTargetInput) {
+            assignTargetInput.addEventListener('input', () => {
+                updateAssignControls();
+            });
+        }
+        if (assignRefreshBtn) {
+            assignRefreshBtn.addEventListener('click', () => {
+                refreshDiscovered();
+            });
+        }
+        if (assignSendBtn) {
+            assignSendBtn.addEventListener('click', async () => {
+                const scanner = getSelectedScanner();
+                const target = assignTargetInput ? assignTargetInput.value.trim() : '';
+                if (!scanner) {
+                    if (assignStatus) {
+                        assignStatus.textContent = 'Choose a scanner before sending.';
+                    }
+                    updateAssignControls();
+                    return;
+                }
+                if (!target) {
+                    if (assignStatus) {
+                        assignStatus.textContent = 'Provide a target beacon ID before sending.';
+                    }
+                    updateAssignControls();
+                    return;
+                }
+                assignSendBtn.disabled = true;
+                if (assignStatus) {
+                    assignStatus.textContent = 'Sending assignment…';
+                }
+                try {
+                    const response = await fetch('/api/scanners/assign', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ scanner_id: scanner, beacon_id: target })
+                    });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    if (assignStatus) {
+                        assignStatus.textContent = `Assignment queued for ${scanner}.`;
+                    }
+                    refreshDiscovered();
+                } catch (err) {
+                    if (assignStatus) {
+                        assignStatus.textContent = `Failed to send assignment: ${err.message}`;
+                    }
+                } finally {
+                    assignSendBtn.disabled = false;
+                    updateAssignControls();
+                }
+            });
+        }
+
         navButtons.forEach((button) => {
             button.addEventListener('click', () => {
                 navButtons.forEach((btn) => btn.classList.remove('active'));
@@ -688,6 +1054,11 @@
                 }
                 if (button.dataset.view === 'config') {
                     loadConfig();
+                }
+                if (button.dataset.view === 'beacon') {
+                    startDiscoveredPolling();
+                } else {
+                    stopDiscoveredPolling();
                 }
             });
         });
@@ -815,6 +1186,15 @@
             setInterval(fetchLocation, 5000);
             loadConfig();
             loadRooms();
+            if (assignScannerSelect) {
+                updateAssignControls();
+                const activeButton = document.querySelector('nav button.active');
+                if (activeButton && activeButton.dataset.view === 'beacon') {
+                    startDiscoveredPolling();
+                } else {
+                    stopDiscoveredPolling();
+                }
+            }
         });
 
         function loadConfig() {

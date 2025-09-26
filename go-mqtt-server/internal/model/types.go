@@ -56,3 +56,16 @@ type RoomDefinition struct {
 	Z      float64 `json:"z"`
 	Radius float64 `json:"radius"`
 }
+
+// DiscoveredBeacon represents a beacon advertisement observed while a scanner is in discovery mode.
+type DiscoveredBeacon struct {
+	ScannerID        string    `json:"scanner_id"`
+	TagAddress       string    `json:"tag_address"`
+	TagName          string    `json:"tag_name,omitempty"`
+	RSSI             int       `json:"rssi"`
+	ManufacturerID   *int      `json:"manufacturer_id,omitempty"`
+	ManufacturerData string    `json:"manufacturer_data,omitempty"`
+	TxPower          *int      `json:"tx_power,omitempty"`
+	EventType        string    `json:"event_type,omitempty"`
+	LastSeen         time.Time `json:"last_seen"`
+}

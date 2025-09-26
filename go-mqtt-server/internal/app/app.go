@@ -127,6 +127,8 @@ func (a *App) handleMQTTPublish(ctx context.Context, msg mqttbroker.PublishMessa
 	switch {
 	case strings.HasPrefix(msg.Topic, "beacons/"):
 		a.handleBeaconReading(ctx, msg)
+	case strings.HasPrefix(msg.Topic, "scanners/"):
+		a.handleScannerMessage(ctx, msg)
 	case strings.HasPrefix(msg.Topic, "catlocator/training/commands"):
 		a.handleTrainingCommand(ctx, msg)
 	default:
@@ -170,6 +172,105 @@ func (a *App) handleBeaconReading(ctx context.Context, msg mqttbroker.PublishMes
 	}
 
 	a.logger.Info("ingested beacon reading", "beacon", reading.BeaconID, "tag", reading.TagID, "rssi", reading.RSSI)
+}
+
+func (a *App) handleScannerMessage(ctx context.Context, msg mqttbroker.PublishMessage) {
+	parts := strings.Split(msg.Topic, "/")
+	if len(parts) < 3 {
+		a.logger.Debug("scanner topic ignored", "topic", msg.Topic)
+		return
+	}
+
+	scannerID := parts[1]
+	action := parts[2]
+
+	switch action {
+	case "inventory":
+		a.handleScannerInventory(ctx, scannerID, msg)
+	case "state":
+		a.logger.Info("scanner state", "scanner", scannerID, "payload", string(msg.Payload))
+	default:
+		a.logger.Debug("unhandled scanner topic", "topic", msg.Topic)
+	}
+}
+
+type scannerInventoryPayload struct {
+	ScannerID        string `json:"scanner_id"`
+	TagAddress       string `json:"tag_address"`
+	TagName          string `json:"tag_name"`
+	RSSI             int    `json:"rssi"`
+	ManufacturerID   *int   `json:"manufacturer_id"`
+	ManufacturerData string `json:"manufacturer_data"`
+	TxPower          *int   `json:"tx_power"`
+	EventType        string `json:"event_type"`
+	Timestamp        string `json:"timestamp"`
+}
+
+func (a *App) handleScannerInventory(ctx context.Context, scannerID string, msg mqttbroker.PublishMessage) {
+	if a.store == nil {
+		return
+	}
+
+	var payload scannerInventoryPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		a.logger.Warn("scanner inventory decode failed", "scanner", scannerID, "error", err)
+		return
+	}
+
+	if payload.ScannerID == "" {
+		payload.ScannerID = scannerID
+	}
+	if payload.TagAddress == "" {
+		a.logger.Debug("inventory payload missing tag address", "scanner", scannerID)
+		return
+	}
+
+	var lastSeen time.Time
+	if payload.Timestamp != "" {
+		var err error
+		lastSeen, err = time.Parse(time.RFC3339Nano, payload.Timestamp)
+		if err != nil {
+			lastSeen, err = time.Parse(time.RFC3339, payload.Timestamp)
+			if err != nil {
+				lastSeen = time.Now().UTC()
+			}
+		}
+	} else {
+		lastSeen = time.Now().UTC()
+	}
+
+	beacon := model.DiscoveredBeacon{
+		ScannerID:        payload.ScannerID,
+		TagAddress:       strings.ToUpper(payload.TagAddress),
+		TagName:          payload.TagName,
+		RSSI:             payload.RSSI,
+		ManufacturerData: payload.ManufacturerData,
+		EventType:        payload.EventType,
+		LastSeen:         lastSeen,
+	}
+	if payload.ManufacturerID != nil {
+		id := *payload.ManufacturerID
+		beacon.ManufacturerID = &id
+	}
+	if payload.TxPower != nil {
+		p := *payload.TxPower
+		beacon.TxPower = &p
+	}
+
+	storeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if err := a.store.UpsertDiscoveredBeacon(storeCtx, beacon); err != nil {
+		a.logger.Error("failed to upsert discovered beacon", "scanner", scannerID, "error", err)
+		return
+	}
+
+	a.logger.Info("scanner inventory update",
+		"scanner", scannerID,
+		"tag", beacon.TagAddress,
+		"name", beacon.TagName,
+		"rssi", beacon.RSSI,
+		"event", beacon.EventType)
 }
 
 func (a *App) handleTrainingCommand(ctx context.Context, msg mqttbroker.PublishMessage) {
@@ -236,6 +337,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/api/export/training", a.handleExportTraining)
 	mux.HandleFunc("/api/admin/wipe", a.handleWipeDatabase)
 	mux.HandleFunc("/api/location/cat", a.handleCatLocation)
+	mux.HandleFunc("/api/scanners/discovered", a.handleDiscoveredScanners)
+	mux.HandleFunc("/api/scanners/assign", a.handleAssignScanner)
 	mux.HandleFunc("/static/", func(w http.ResponseWriter, r *http.Request) {
 		http.StripPrefix("/static/", http.FileServer(http.Dir("web"))).ServeHTTP(w, r)
 	})
@@ -326,6 +429,103 @@ func (a *App) handleRooms(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (a *App) handleDiscoveredScanners(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.store == nil {
+		http.Error(w, "store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	beacons, err := a.store.ListDiscoveredBeacons(ctx)
+	if err != nil {
+		a.logger.Error("discovered beacons query failed", "error", err)
+		http.Error(w, "failed to load discovered beacons", http.StatusInternalServerError)
+		return
+	}
+
+	if filter := strings.TrimSpace(r.URL.Query().Get("scanner_id")); filter != "" {
+		filtered := beacons[:0]
+		for _, b := range beacons {
+			if strings.EqualFold(b.ScannerID, filter) {
+				filtered = append(filtered, b)
+			}
+		}
+		beacons = filtered
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Discovered []model.DiscoveredBeacon `json:"discovered"`
+	}{Discovered: beacons})
+}
+
+func (a *App) handleAssignScanner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.broker == nil {
+		http.Error(w, "mqtt broker not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var payload struct {
+		ScannerID string          `json:"scanner_id"`
+		BeaconID  string          `json:"beacon_id"`
+		Location  *model.Location `json:"location,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	payload.ScannerID = strings.TrimSpace(payload.ScannerID)
+	payload.BeaconID = strings.TrimSpace(payload.BeaconID)
+
+	if payload.ScannerID == "" || payload.BeaconID == "" {
+		http.Error(w, "scanner_id and beacon_id are required", http.StatusBadRequest)
+		return
+	}
+
+	command := map[string]interface{}{
+		"command":   "assign",
+		"beacon_id": payload.BeaconID,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if payload.Location != nil {
+		command["location"] = payload.Location
+	}
+
+	data, err := json.Marshal(command)
+	if err != nil {
+		a.logger.Error("assign marshal failed", "error", err)
+		http.Error(w, "failed to marshal command", http.StatusInternalServerError)
+		return
+	}
+
+	topic := fmt.Sprintf("scanners/%s/control", payload.ScannerID)
+	if err := a.broker.Publish(topic, data); err != nil {
+		a.logger.Error("assign publish failed", "topic", topic, "error", err)
+		http.Error(w, "failed to publish command", http.StatusInternalServerError)
+		return
+	}
+
+	a.logger.Info("scanner assign command sent", "scanner", payload.ScannerID, "beacon", payload.BeaconID)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
 }
 
 func (a *App) handleBeaconPublish(w http.ResponseWriter, r *http.Request) {
